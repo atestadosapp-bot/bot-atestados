@@ -862,12 +862,21 @@ app_web = Flask(__name__)
 def health_check():
     return "Bot is running!"
 
-def ejecutar_bot():
-    # Esta función contiene tu main() original
+if __name__ == "__main__":
+    # 1. Iniciar el servidor web de Flask en un hilo secundario
+    def iniciar_flask():
+        import os
+        puerto = int(os.environ.get("PORT", 8080))
+        app_web.run(host="0.0.0.0", port=puerto)
+
+    hilo_flask = threading.Thread(target=iniciar_flask)
+    hilo_flask.daemon = True
+    hilo_flask.start()
+
+    # 2. Iniciar el bot en el hilo principal (obligatorio)
     print("🤖 Iniciando bot...")
     app = Application.builder().token(TOKEN).build()
-    # ... (aquí van todos tus app.add_handler...)
-    # (Copia exactamente los mismos handlers que tenías en tu main)
+    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("total", total))
@@ -885,15 +894,3 @@ def ejecutar_bot():
     
     print("✅ Bot activo. Escuchando mensajes...")
     app.run_polling()
-
-if __name__ == "__main__":
-    # 1. Iniciar el bot en un hilo separado para que no bloquee a Flask
-    hilo_bot = threading.Thread(target=ejecutar_bot)
-    hilo_bot.daemon = True
-    hilo_bot.start()
-    
-    # 2. Iniciar el servidor web de Flask (Render usará esto para saber que estás vivo)
-    # Render asigna el puerto automáticamente en la variable de entorno PORT
-    import os
-    puerto = int(os.environ.get("PORT", 8080))
-    app_web.run(host="0.0.0.0", port=puerto)
