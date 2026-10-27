@@ -10,7 +10,7 @@ from telegram.ext import ConversationHandler, MessageHandler, filters
 # ==========================================
 # CONFIGURACIÓN
 # ==========================================
-TOKEN = "8802170768:AAEVgJr0fBFvSX3Ft0k0-LLbOUlBYEjJTH0"
+TOKEN = ""
 DB_NAME = "atestados_backup_1791223653484.db"
 
 # Estados para el ConversationHandler de /registrar
