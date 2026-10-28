@@ -1,13 +1,13 @@
-import sqlite3
 import os
-import tempfile
+import sqlite3
+import threading
+from flask import Flask
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, ContextTypes,
     ConversationHandler, MessageHandler, filters, CallbackQueryHandler
 )
-
 # ==========================================
 # CONFIGURACIÓN
 # ==========================================
@@ -987,25 +987,40 @@ async def eliminar_usuario_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"✅ Usuario `{dpi}` eliminado.", parse_mode="Markdown")
     else:
         await update.message.reply_text(f"❌ No se encontró.")
+        
+# ==========================================
+# MAIN Y SERVIDOR WEB PARA RENDER
+# ==========================================
 
-# ==========================================
-# MAIN
-# ==========================================
-def main():
+app_web = Flask(__name__)
+
+@app_web.route('/')
+def health_check():
+    return "Bot is running!"
+
+if __name__ == "__main__":
+    # 1. Iniciar Flask en un hilo secundario (para que Render detecte el puerto)
+    def iniciar_flask():
+        import os
+        puerto = int(os.environ.get("PORT", 8080))
+        app_web.run(host="0.0.0.0", port=puerto)
+
+    hilo_flask = threading.Thread(target=iniciar_flask)
+    hilo_flask.daemon = True
+    hilo_flask.start()
+
+    # 2. Iniciar el bot en el hilo principal (obligatorio)
     print("🤖 Iniciando bot...")
     inicializar_tabla_telegram()
     
     app = Application.builder().token(TOKEN).build()
     
-    # Comandos de texto (rápidos)
+    # Comandos de texto
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("mi_id", mi_id))
     app.add_handler(CommandHandler("buscar", buscar))
     app.add_handler(CommandHandler("etiqueta", etiqueta))
-    # (Agrega aquí los demás comandos que tenías: /total, /general, etc.)
-  
-    # AGREGAR ESTOS REGISTROS NUEVOS:
     app.add_handler(CommandHandler("total", total))
     app.add_handler(CommandHandler("general", general))
     app.add_handler(CommandHandler("fecha", fecha))
@@ -1015,6 +1030,7 @@ def main():
     app.add_handler(CommandHandler("agregar_usuario", agregar_usuario_cmd))
     app.add_handler(CommandHandler("usuarios", usuarios))
     app.add_handler(CommandHandler("eliminar_usuario", eliminar_usuario_cmd))  
+    
     # Comandos de Admin
     app.add_handler(CommandHandler("autorizar", autorizar))
     app.add_handler(CommandHandler("lista_autorizados", lista_autorizados))
@@ -1042,7 +1058,8 @@ def main():
     app.add_handler(conv_handler)
     
     print("✅ Bot activo. Presiona /start en Telegram.")
+    
+    # 3. Encender el bot
     app.run_polling()
 
-if __name__ == "__main__":
-    main()
+
