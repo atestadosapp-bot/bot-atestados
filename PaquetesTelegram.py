@@ -431,7 +431,7 @@ def generar_pdf_etiqueta(dpi, fecha_del, fecha_al, num, num_gen, ubicacion):
         pdf.set_xy(margen, y_ubicacion + 4)
         pdf.set_font("Helvetica", "B", 12)
         pdf.set_text_color(*color_azul)
-        pdf.cell(ancho_total, 6, f"📍 UBICACIÓN: {ubicacion}", align="C")
+        pdf.cell(ancho_total, 6, f"UBICACIÓN: {ubicacion}", align="C")
         
         # Línea de corte
         y_corte = y_ubicacion + 25
