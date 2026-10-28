@@ -697,10 +697,7 @@ async def etiqueta(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        # 1. Buscar por número de paquete
         res = buscar_por_dpi_y_numero(dpi, num)
-        
-        # 2. Si no, buscar por número general
         if not res:
             res = buscar_por_numero_general(num)
             if res and res.get("usuario_codigo") != dpi:
@@ -715,16 +712,27 @@ async def etiqueta(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if ruta:
             with open(ruta, "rb") as f:
-                await update.message.reply_document(document=f, filename=f"etiqueta_{dpi}_{num_real}.pdf")
+                caption = (
+                    f"🏷️ *Etiquetas del Paquete N° {num_real}*\n\n"
+                    f"👤 DPI: `{dpi}`\n"
+                    f"📅 {res.get('fecha_del')} al {res.get('fecha_al')}\n"
+                    f"📍 `{res.get('ubicacion_armada')}`\n\n"
+                    f"📄 *Formato:* PDF (listo para imprimir)\n"
+                    f"📐 *Tamaño:* Carta\n"
+                    f"🏷️ *Contiene:* Etiqueta ancha + angosta"
+                )
+                await update.message.reply_document(
+                    document=f, 
+                    filename=f"etiqueta_{dpi}_{num_real}.pdf",
+                    caption=caption,
+                    parse_mode="Markdown"
+                )
             os.remove(ruta)
         else: 
             await update.message.reply_text(f"❌ Error al generar PDF: {error}")
             
     except Exception as e:
-        # Si hay un error catastrófico, avisar en Telegram
         await update.message.reply_text(f"❌ Error inesperado: {str(e)}")
-# (Aquí irían tus otras funciones como /total, /general, /eliminar, /editar, etc. 
-# Por razones de espacio solo puse las principales, pero el código base es el mismo)
 
 # ==========================================
 # REGISTRO PASO A PASO (CONVERSATION HANDLER)
