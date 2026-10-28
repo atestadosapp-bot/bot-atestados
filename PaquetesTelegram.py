@@ -341,7 +341,7 @@ def generar_pdf_etiqueta(dpi, fecha_del, fecha_al, num, num_gen, ubicacion):
     try:
         from fpdf import FPDF
     except ImportError:
-        return None, "No tienes 'fpdf2'. Instálalo desde Menu → Pip."
+        return None, "No tienes 'fpdf2'."
     
     def a_formato_mostrar(fecha):
         if not fecha or fecha == "?":
@@ -359,91 +359,95 @@ def generar_pdf_etiqueta(dpi, fecha_del, fecha_al, num, num_gen, ubicacion):
     num_str = str(num)
     gral = str(num_gen) if num_gen is not None else "-"
     
-    pdf = FPDF(orientation="P", unit="mm", format="Letter")
-    pdf.add_page()
-    pdf.set_auto_page_break(auto=False)
-    
-    margen_izq = 10
-    margen_sup = 15
-    ancho_disponible = 215.9 - 20
-    ancho_ancha = ancho_disponible * 0.62
-    ancho_sep = ancho_disponible * 0.06
-    ancho_angosta = ancho_disponible * 0.32
-    
-    x_ancha = margen_izq
-    x_sep = x_ancha + ancho_ancha
-    x_angosta = x_sep + ancho_sep
-    y_inicio = margen_sup
-    ancho_alto = 70
-    
-    # ETIQUETA ANCHA
-    pdf.set_draw_color(0, 0, 0)
-    pdf.set_line_width(0.8)
-    pdf.rect(x_ancha, y_inicio, ancho_ancha, ancho_alto)
-    pdf.set_fill_color(221, 221, 221)
-    pdf.rect(x_ancha, y_inicio, ancho_ancha, 12, style="F")
-    pdf.set_xy(x_ancha, y_inicio + 2)
-    pdf.set_font("Helvetica", "B", 20)
-    pdf.cell(ancho_ancha, 8, dpi, align="C")
-    pdf.set_line_width(0.8)
-    pdf.line(x_ancha, y_inicio + 12, x_ancha + ancho_ancha, y_inicio + 12)
-    pdf.set_xy(x_ancha + 3, y_inicio + 14)
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(ancho_ancha - 6, 8, f"DEL: {del_mostrar}", align="L")
-    pdf.set_xy(x_ancha + 3, y_inicio + 22)
-    pdf.cell(ancho_ancha - 6, 8, f"AL: {al_mostrar}", align="L")
-    pdf.line(x_ancha, y_inicio + 30, x_ancha + ancho_ancha, y_inicio + 30)
-    pdf.set_xy(x_ancha, y_inicio + 33)
-    pdf.set_font("Helvetica", "B", 38)
-    pdf.cell(ancho_ancha, 18, f"No. {num_str}", align="C")
-    pdf.set_xy(x_ancha + 3, y_inicio + 52)
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_text_color(85, 85, 85)
-    pdf.cell(ancho_ancha - 6, 5, f"Gral. N° {gral}", align="R")
-    pdf.set_text_color(0, 0, 0)
-    pdf.line(x_ancha, y_inicio + 58, x_ancha + ancho_ancha, y_inicio + 58)
-    pdf.set_xy(x_ancha, y_inicio + 60)
-    pdf.set_font("Helvetica", "", 14)
-    pdf.cell(ancho_ancha, 8, f"Ubicación: {ubicacion}", align="C")
-    
-    # LÍNEA DE CORTE
-    pdf.set_line_width(0.5)
-    y_actual = y_inicio
-    while y_actual < y_inicio + ancho_alto:
-        pdf.line(x_sep + ancho_sep / 2, y_actual, x_sep + ancho_sep / 2, y_actual + 2)
-        y_actual += 4
-    
-    # ETIQUETA ANGOSTA
-    pdf.set_line_width(0.8)
-    pdf.rect(x_angosta, y_inicio, ancho_angosta, ancho_alto)
-    pdf.set_fill_color(221, 221, 221)
-    pdf.rect(x_angosta, y_inicio, ancho_angosta, 10, style="F")
-    pdf.set_xy(x_angosta, y_inicio + 1.5)
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(ancho_angosta, 7, dpi, align="C")
-    pdf.line(x_angosta, y_inicio + 10, x_angosta + ancho_angosta, y_inicio + 10)
-    pdf.set_xy(x_angosta, y_inicio + 12)
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(ancho_angosta, 6, f"DEL: {del_mostrar}", align="C")
-    pdf.set_xy(x_angosta, y_inicio + 18)
-    pdf.cell(ancho_angosta, 6, f"AL: {al_mostrar}", align="C")
-    pdf.line(x_angosta, y_inicio + 25, x_angosta + ancho_angosta, y_inicio + 25)
-    pdf.set_xy(x_angosta, y_inicio + 28)
-    pdf.set_font("Helvetica", "B", 30)
-    pdf.cell(ancho_angosta, 15, f"No. {num_str}", align="C")
-    pdf.set_xy(x_angosta, y_inicio + 45)
-    pdf.set_font("Helvetica", "", 8)
-    pdf.set_text_color(85, 85, 85)
-    pdf.cell(ancho_angosta - 2, 5, f"Gral. {gral}", align="R")
-    pdf.set_text_color(0, 0, 0)
-    pdf.line(x_angosta, y_inicio + 52, x_angosta + ancho_angosta, y_inicio + 52)
-    pdf.set_xy(x_angosta, y_inicio + 54)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(ancho_angosta, 6, f"Ubic: {ubicacion}", align="C")
-    
-    ruta = os.path.join(tempfile.gettempdir(), f"etiquetas_{dpi}_{num}.pdf")
-    pdf.output(ruta)
-    return ruta, None
+    try:
+        pdf = FPDF(orientation="P", unit="mm", format="Letter")
+        pdf.add_page()
+        pdf.set_auto_page_break(auto=False)
+        
+        margen_izq = 10
+        margen_sup = 15
+        ancho_disponible = 215.9 - 20
+        ancho_ancha = ancho_disponible * 0.62
+        ancho_sep = ancho_disponible * 0.06
+        ancho_angosta = ancho_disponible * 0.32
+        
+        x_ancha = margen_izq
+        x_sep = x_ancha + ancho_ancha
+        x_angosta = x_sep + ancho_sep
+        y_inicio = margen_sup
+        ancho_alto = 70
+        
+        # ETIQUETA ANCHA
+        pdf.set_draw_color(0, 0, 0)
+        pdf.set_line_width(0.8)
+        pdf.rect(x_ancha, y_inicio, ancho_ancha, ancho_alto)
+        pdf.set_fill_color(221, 221, 221)
+        pdf.rect(x_ancha, y_inicio, ancho_ancha, 12, style="F")
+        pdf.set_xy(x_ancha, y_inicio + 2)
+        pdf.set_font("Helvetica", "B", 20) # <-- CAMBIADO A HELVETICA
+        pdf.cell(ancho_ancha, 8, dpi, align="C")
+        pdf.set_line_width(0.8)
+        pdf.line(x_ancha, y_inicio + 12, x_ancha + ancho_ancha, y_inicio + 12)
+        pdf.set_xy(x_ancha + 3, y_inicio + 14)
+        pdf.set_font("Helvetica", "B", 16) # <-- CAMBIADO A HELVETICA
+        pdf.cell(ancho_ancha - 6, 8, f"DEL: {del_mostrar}", align="L")
+        pdf.set_xy(x_ancha + 3, y_inicio + 22)
+        pdf.cell(ancho_ancha - 6, 8, f"AL: {al_mostrar}", align="L")
+        pdf.line(x_ancha, y_inicio + 30, x_ancha + ancho_ancha, y_inicio + 30)
+        pdf.set_xy(x_ancha, y_inicio + 33)
+        pdf.set_font("Helvetica", "B", 38) # <-- CAMBIADO A HELVETICA
+        pdf.cell(ancho_ancha, 18, f"No. {num_str}", align="C")
+        pdf.set_xy(x_ancha + 3, y_inicio + 52)
+        pdf.set_font("Helvetica", "", 9) # <-- CAMBIADO A HELVETICA
+        pdf.set_text_color(85, 85, 85)
+        pdf.cell(ancho_ancha - 6, 5, f"Gral. N° {gral}", align="R")
+        pdf.set_text_color(0, 0, 0)
+        pdf.line(x_ancha, y_inicio + 58, x_ancha + ancho_ancha, y_inicio + 58)
+        pdf.set_xy(x_ancha, y_inicio + 60)
+        pdf.set_font("Helvetica", "", 14) # <-- CAMBIADO A HELVETICA
+        pdf.cell(ancho_ancha, 8, f"Ubicación: {ubicacion}", align="C")
+        
+        # LÍNEA DE CORTE
+        pdf.set_line_width(0.5)
+        y_actual = y_inicio
+        while y_actual < y_inicio + ancho_alto:
+            pdf.line(x_sep + ancho_sep / 2, y_actual, x_sep + ancho_sep / 2, y_actual + 2)
+            y_actual += 4
+        
+        # ETIQUETA ANGOSTA
+        pdf.set_line_width(0.8)
+        pdf.rect(x_angosta, y_inicio, ancho_angosta, ancho_alto)
+        pdf.set_fill_color(221, 221, 221)
+        pdf.rect(x_angosta, y_inicio, ancho_angosta, 10, style="F")
+        pdf.set_xy(x_angosta, y_inicio + 1.5)
+        pdf.set_font("Helvetica", "B", 14) # <-- CAMBIADO A HELVETICA
+        pdf.cell(ancho_angosta, 7, dpi, align="C")
+        pdf.line(x_angosta, y_inicio + 10, x_angosta + ancho_angosta, y_inicio + 10)
+        pdf.set_xy(x_angosta, y_inicio + 12)
+        pdf.set_font("Helvetica", "B", 12) # <-- CAMBIADO A HELVETICA
+        pdf.cell(ancho_angosta, 6, f"DEL: {del_mostrar}", align="C")
+        pdf.set_xy(x_angosta, y_inicio + 18)
+        pdf.cell(ancho_angosta, 6, f"AL: {al_mostrar}", align="C")
+        pdf.line(x_angosta, y_inicio + 25, x_angosta + ancho_angosta, y_inicio + 25)
+        pdf.set_xy(x_angosta, y_inicio + 28)
+        pdf.set_font("Helvetica", "B", 30) # <-- CAMBIADO A HELVETICA
+        pdf.cell(ancho_angosta, 15, f"No. {num_str}", align="C")
+        pdf.set_xy(x_angosta, y_inicio + 45)
+        pdf.set_font("Helvetica", "", 8) # <-- CAMBIADO A HELVETICA
+        pdf.set_text_color(85, 85, 85)
+        pdf.cell(ancho_angosta - 2, 5, f"Gral. {gral}", align="R")
+        pdf.set_text_color(0, 0, 0)
+        pdf.line(x_angosta, y_inicio + 52, x_angosta + ancho_angosta, y_inicio + 52)
+        pdf.set_xy(x_angosta, y_inicio + 54)
+        pdf.set_font("Helvetica", "", 10) # <-- CAMBIADO A HELVETICA
+        pdf.cell(ancho_angosta, 6, f"Ubic: {ubicacion}", align="C")
+        
+        ruta = os.path.join(tempfile.gettempdir(), f"etiquetas_{dpi}_{num}.pdf")
+        pdf.output(ruta)
+        return ruta, None
+    except Exception as e:
+        # Si algo falla en el PDF, devolvemos el error para que el bot nos avise
+        return None, str(e)
 
 # ==========================================
 # VERIFICACIÓN DE ACCESO
@@ -672,17 +676,34 @@ async def etiqueta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except: 
         await update.message.reply_text("⚠️ Número inválido.")
         return
-    res = buscar_por_dpi_y_numero(dpi, num)
-    if not res: 
-        await update.message.reply_text(f"❌ No se encontró.", parse_mode="Markdown")
-        return
-    ruta, error = generar_pdf_etiqueta(dpi, res.get("fecha_del"), res.get("fecha_al"), num, res.get("numero_general"), res.get("ubicacion_armada"))
-    if ruta:
-        with open(ruta, "rb") as f:
-            await update.message.reply_document(document=f, filename=f"etiqueta_{dpi}_{num}.pdf")
-        os.remove(ruta)
-    else: await update.message.reply_text(f"❌ {error}")
+    
+    try:
+        # 1. Buscar por número de paquete
+        res = buscar_por_dpi_y_numero(dpi, num)
+        
+        # 2. Si no, buscar por número general
+        if not res:
+            res = buscar_por_numero_general(num)
+            if res and res.get("usuario_codigo") != dpi:
+                res = None 
 
+        if not res: 
+            await update.message.reply_text(f"❌ No se encontró N° {num} para el DPI `{dpi}`.", parse_mode="Markdown")
+            return
+        
+        num_real = res.get("num_paquete")
+        ruta, error = generar_pdf_etiqueta(dpi, res.get("fecha_del"), res.get("fecha_al"), num_real, res.get("numero_general"), res.get("ubicacion_armada"))
+        
+        if ruta:
+            with open(ruta, "rb") as f:
+                await update.message.reply_document(document=f, filename=f"etiqueta_{dpi}_{num_real}.pdf")
+            os.remove(ruta)
+        else: 
+            await update.message.reply_text(f"❌ Error al generar PDF: {error}")
+            
+    except Exception as e:
+        # Si hay un error catastrófico, avisar en Telegram
+        await update.message.reply_text(f"❌ Error inesperado: {str(e)}")
 # (Aquí irían tus otras funciones como /total, /general, /eliminar, /editar, etc. 
 # Por razones de espacio solo puse las principales, pero el código base es el mismo)
 
