@@ -345,11 +345,14 @@ def generar_pdf_etiqueta(dpi, fecha_del, fecha_al, num, num_gen, ubicacion):
         return None, "No tienes 'fpdf2'."
     
     def a_formato_mostrar(fecha):
-        if not fecha or fecha == "?": return fecha
+        if not fecha or fecha == "?":
+            return fecha
         try:
             partes = fecha.split("-")
-            if len(partes) == 3: return f"{partes[2]}/{partes[1]}/{partes[0]}"
-        except: pass
+            if len(partes) == 3:
+                return f"{partes[2]}/{partes[1]}/{partes[0]}"
+        except:
+            pass
         return fecha
     
     del_mostrar = a_formato_mostrar(fecha_del)
@@ -362,105 +365,106 @@ def generar_pdf_etiqueta(dpi, fecha_del, fecha_al, num, num_gen, ubicacion):
         pdf.add_page()
         pdf.set_auto_page_break(auto=False)
         
-        # Colores del diseño (Azul oscuro y grises)
-        color_azul = (41, 65, 122)
-        color_gris = (240, 240, 240)
+        margen_izq = 10
+        margen_sup = 15
+        ancho_disponible = 215.9 - 20
+        ancho_ancha = ancho_disponible * 0.62
+        ancho_sep = ancho_disponible * 0.06
+        ancho_angosta = ancho_disponible * 0.32
         
-        # --- CONTENEDOR PRINCIPAL ---
-        margen = 15
-        ancho_total = 215.9 - (margen * 2)
+        x_ancha = margen_izq
+        x_sep = x_ancha + ancho_ancha
+        x_angosta = x_sep + ancho_sep
+        y_inicio = margen_sup
+        ancho_alto = 70
         
-        # 1. Encabezado (Logos y Título)
-        pdf.set_xy(margen, margen)
+        # ==================== ETIQUETA ANCHA ====================
+        pdf.set_draw_color(0, 0, 0)
+        pdf.set_line_width(0.8)
+        pdf.rect(x_ancha, y_inicio, ancho_ancha, ancho_alto)
+        
+        # Encabezado gris
+        pdf.set_fill_color(221, 221, 221)
+        pdf.rect(x_ancha, y_inicio, ancho_ancha, 12, style="F")
+        pdf.set_xy(x_ancha, y_inicio + 2)
+        pdf.set_font("Helvetica", "B", 20) # Usamos Helvetica
+        pdf.cell(ancho_ancha, 8, dpi, align="C")
+        
+        pdf.set_line_width(0.8)
+        pdf.line(x_ancha, y_inicio + 12, x_ancha + ancho_ancha, y_inicio + 12)
+        
+        # Fechas
+        pdf.set_xy(x_ancha + 3, y_inicio + 14)
         pdf.set_font("Helvetica", "B", 16)
-        pdf.set_text_color(*color_azul)
-        pdf.cell(ancho_total, 10, "SALPICADERO DE ATESTADOS", align="C")
+        pdf.cell(ancho_ancha - 6, 8, f"DEL: {del_mostrar}", align="L")
         
-        # Línea divisoria
-        pdf.set_draw_color(*color_azul)
+        pdf.set_xy(x_ancha + 3, y_inicio + 22)
+        pdf.cell(ancho_ancha - 6, 8, f"AL: {al_mostrar}", align="L")
+        
+        pdf.line(x_ancha, y_inicio + 30, x_ancha + ancho_ancha, y_inicio + 30)
+        
+        # Número Grande
+        pdf.set_xy(x_ancha, y_inicio + 33)
+        pdf.set_font("Helvetica", "B", 38)
+        pdf.cell(ancho_ancha, 18, f"No. {num_str}", align="C")
+        
+        # Número general
+        pdf.set_xy(x_ancha + 3, y_inicio + 52)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(85, 85, 85)
+        pdf.cell(ancho_ancha - 6, 5, f"Gral. N° {gral}", align="R")
+        pdf.set_text_color(0, 0, 0)
+        
+        pdf.line(x_ancha, y_inicio + 58, x_ancha + ancho_ancha, y_inicio + 58)
+        
+        # Ubicación
+        pdf.set_xy(x_ancha, y_inicio + 60)
+        pdf.set_font("Helvetica", "", 14)
+        pdf.cell(ancho_ancha, 8, f"Ubicación: {ubicacion}", align="C")
+        
+        # ==================== LÍNEA DE CORTE ====================
         pdf.set_line_width(0.5)
-        pdf.line(margen, margen + 12, 215.9 - margen, margen + 12)
+        y_actual = y_inicio
+        while y_actual < y_inicio + ancho_alto:
+            pdf.line(x_sep + ancho_sep / 2, y_actual, x_sep + ancho_sep / 2, y_actual + 2)
+            y_actual += 4
         
-        # --- SECCIÓN SUPERIOR (Datos del Paquete) ---
-        y_actual = margen + 20
+        # ==================== ETIQUETA ANGOSTA ====================
+        pdf.set_line_width(0.8)
+        pdf.rect(x_angosta, y_inicio, ancho_angosta, ancho_alto)
         
-        # Foto (Placeholder)
-        pdf.set_fill_color(*color_gris)
-        pdf.rect(margen, y_actual, 30, 35, style="F")
-        pdf.set_xy(margen, y_actual + 15)
-        pdf.set_font("Helvetica", "I", 8)
-        pdf.set_text_color(100, 100, 100)
-        pdf.cell(30, 5, "FOTO", align="C")
+        pdf.set_fill_color(221, 221, 221)
+        pdf.rect(x_angosta, y_inicio, ancho_angosta, 10, style="F")
+        pdf.set_xy(x_angosta, y_inicio + 1.5)
+        pdf.set_font("Helvetica", "B", 14)
+        pdf.cell(ancho_angosta, 7, dpi, align="C")
         
-        # Detalles del paquete
-        pdf.set_xy(margen + 35, y_actual)
+        pdf.line(x_angosta, y_inicio + 10, x_angosta + ancho_angosta, y_inicio + 10)
+        
+        pdf.set_xy(x_angosta, y_inicio + 12)
         pdf.set_font("Helvetica", "B", 12)
-        pdf.set_text_color(0, 0, 0)
-        pdf.cell(100, 8, f"Código de Paquete: N° {num_str}")
+        pdf.cell(ancho_angosta, 6, f"DEL: {del_mostrar}", align="C")
         
-        pdf.set_xy(margen + 35, y_actual + 8)
-        pdf.set_font("Helvetica", "", 10)
-        pdf.cell(100, 6, f"DPI/Código: {dpi}")
-        pdf.set_xy(margen + 35, y_actual + 15)
-        pdf.cell(100, 6, f"N° General: {gral}")
-        pdf.set_xy(margen + 35, y_actual + 22)
-        pdf.cell(100, 6, f"Fechas: {del_mostrar} al {al_mostrar}")
+        pdf.set_xy(x_angosta, y_inicio + 18)
+        pdf.cell(ancho_angosta, 6, f"AL: {al_mostrar}", align="C")
         
-        # Código de Barras (Simulado visualmente con líneas)
-        pdf.set_xy(margen + 140, y_actual)
+        pdf.line(x_angosta, y_inicio + 25, x_angosta + ancho_angosta, y_inicio + 25)
+        
+        pdf.set_xy(x_angosta, y_inicio + 28)
+        pdf.set_font("Helvetica", "B", 30)
+        pdf.cell(ancho_angosta, 15, f"No. {num_str}", align="C")
+        
+        pdf.set_xy(x_angosta, y_inicio + 45)
         pdf.set_font("Helvetica", "", 8)
-        pdf.cell(40, 5, "Escanea para verificar", align="C")
-        
-        # Dibujamos un falso código de barras
-        pdf.set_fill_color(0, 0, 0)
-        x_barra = margen + 140
-        for i in range(25):
-            ancho_barra = 0.5 if i % 3 == 0 else 1.5
-            pdf.rect(x_barra, y_actual + 6, ancho_barra, 15, style="F")
-            x_barra += ancho_barra + 0.8
-            
-        pdf.set_xy(margen + 140, y_actual + 23)
-        pdf.set_font("Courier", "B", 9)
-        pdf.cell(40, 5, f"*{dpi}*", align="C")
-        
-        # --- SECCIÓN DE UBICACIÓN ---
-        y_ubicacion = y_actual + 45
-        pdf.set_fill_color(*color_gris)
-        pdf.rect(margen, y_ubicacion, ancho_total, 15, style="F")
-        
-        pdf.set_xy(margen, y_ubicacion + 4)
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.set_text_color(*color_azul)
-        pdf.cell(ancho_total, 6, f"UBICACIÓN: {ubicacion}", align="C")
-        
-        # Línea de corte
-        y_corte = y_ubicacion + 25
-        pdf.set_draw_color(150, 150, 150)
-        pdf.set_line_width(0.3)
-        pdf.set_dash_pattern(dash=2, gap=2)
-        pdf.line(margen, y_corte, 215.9 - margen, y_corte)
-        pdf.set_dash_pattern() # Reset
-        
-        # --- PARTE INFERIOR (Duplicado para el corte) ---
-        # Para que sea profesional, hacemos un duplicado exacto más abajo.
-        y_inferior = y_corte + 10
-        
-        # Título inferior
-        pdf.set_xy(margen, y_inferior)
-        pdf.set_font("Helvetica", "B", 14)
-        pdf.set_text_color(*color_azul)
-        pdf.cell(ancho_total, 8, "ETIQUETA DE RASTREO", align="C")
-        
-        # Datos simplificados
-        y_datos_inf = y_inferior + 12
-        pdf.set_xy(margen, y_datos_inf)
-        pdf.set_font("Helvetica", "B", 14)
+        pdf.set_text_color(85, 85, 85)
+        pdf.cell(ancho_angosta - 2, 5, f"Gral. {gral}", align="R")
         pdf.set_text_color(0, 0, 0)
-        pdf.cell(ancho_total, 10, f"N° {num_str}  |  DPI: {dpi}", align="C")
         
-        pdf.set_xy(margen, y_datos_inf + 12)
-        pdf.set_font("Helvetica", "", 12)
-        pdf.cell(ancho_total, 8, f"Ubicación: {ubicacion}  |  General: {gral}", align="C")
+        pdf.line(x_angosta, y_inicio + 52, x_angosta + ancho_angosta, y_inicio + 52)
+        
+        pdf.set_xy(x_angosta, y_inicio + 54)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(ancho_angosta, 6, f"Ubic: {ubicacion}", align="C")
         
         ruta = os.path.join(tempfile.gettempdir(), f"etiquetas_{dpi}_{num}.pdf")
         pdf.output(ruta)
