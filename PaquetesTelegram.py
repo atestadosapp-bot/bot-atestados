@@ -12,7 +12,7 @@ from telegram.ext import (
 # CONFIGURACIÓN
 # ==========================================
 TOKEN = os.environ.get("TELEGRAM_TOKEN","")# <-- Asegúrate de que tu token esté aquí
-DB_NAME = "atestados_backup_1791223653484.db"
+DB_NAME ="atestados_backup_1791223653484.db"
 
 # Tu ID de Telegram (admin inicial)
 ADMIN_INICIAL_ID = 6491907692
