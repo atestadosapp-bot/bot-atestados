@@ -11,7 +11,7 @@ from telegram.ext import (
 # ==========================================
 # CONFIGURACIÓN
 # ==========================================
-TOKEN = "8802170768:AAEVgJr0fBFvSX3Ft0k0-LLbOUlBYEjJTH0" # <-- Asegúrate de que tu token esté aquí
+TOKEN = os.environ.get("TELEGRAM_TOKEN","")# <-- Asegúrate de que tu token esté aquí
 DB_NAME = "atestados_backup_1791223653484.db"
 
 # Tu ID de Telegram (admin inicial)
