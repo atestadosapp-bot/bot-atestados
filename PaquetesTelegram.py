@@ -2,6 +2,7 @@ import os
 import tempfile
 import sqlite3
 import threading
+import libsql_experimental as libsql
 from flask import Flask
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -9,11 +10,13 @@ from telegram.ext import (
     Application, CommandHandler, ContextTypes,
     ConversationHandler, MessageHandler, filters, CallbackQueryHandler
 )
+
 # ==========================================
 # CONFIGURACIÓN
 # ==========================================
-TOKEN = os.environ.get("TELEGRAM_TOKEN","")# <-- Asegúrate de que tu token esté aquí
-DB_NAME ="atestados_backup_1791223653484.db"
+TOKEN = os.environ.get("TELEGRAM_TOKEN","")
+TURSO_URL = "libsql://atestados-atestadosapp.aws-us-east-1.turso.io"
+TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "PON_AQUI_TU_TOKEN_SI_PRUEBAS_LOCAL")
 
 # Tu ID de Telegram (admin inicial)
 ADMIN_INICIAL_ID = 6491907692
@@ -22,10 +25,16 @@ ADMIN_INICIAL_ID = 6491907692
 (REG_DPI, REG_DEL, REG_AL, REG_NUM, REG_EST, REG_FIL, REG_COL, REG_PIL, REG_GENERAL) = range(9)
 
 # ==========================================
+# CONEXIÓN A LA BASE DE DATOS (TURSO)
+# ==========================================
+def conectar_db():
+    return libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
+
+# ==========================================
 # INICIALIZACIÓN DE LA TABLA DE USUARIOS TELEGRAM
 # ==========================================
 def inicializar_tabla_telegram():
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS usuarios_telegram (
@@ -55,7 +64,7 @@ def inicializar_tabla_telegram():
 # ==========================================
 def usuario_autorizado(telegram_id):
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = conectar_db()
         cursor = conn.cursor()
         cursor.execute(
             "SELECT telegram_id, nombre, rol, dpi_asignado, activo FROM usuarios_telegram WHERE telegram_id = ?",
@@ -76,7 +85,7 @@ def usuario_autorizado(telegram_id):
         return None
 
 def agregar_autorizado(telegram_id, nombre, rol, dpi_asignado=None):
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     try:
         cursor.execute("""
@@ -93,7 +102,7 @@ def agregar_autorizado(telegram_id, nombre, rol, dpi_asignado=None):
         conn.close()
 
 def desactivar_autorizado(telegram_id):
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute("UPDATE usuarios_telegram SET activo = 0 WHERE telegram_id = ?", (telegram_id,))
     filas = cursor.rowcount
@@ -102,7 +111,7 @@ def desactivar_autorizado(telegram_id):
     return filas > 0
 
 def listar_autorizados():
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute("SELECT telegram_id, nombre, rol, dpi_asignado, activo FROM usuarios_telegram ORDER BY rol, nombre")
     filas = cursor.fetchall()
@@ -110,7 +119,7 @@ def listar_autorizados():
     return filas
 
 def cambiar_rol(telegram_id, nuevo_rol, nuevo_dpi=None):
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute(
         "UPDATE usuarios_telegram SET rol = ?, dpi_asignado = ? WHERE telegram_id = ?",
@@ -125,7 +134,7 @@ def cambiar_rol(telegram_id, nuevo_rol, nuevo_dpi=None):
 # FUNCIONES DE BASE DE DATOS (PAQUETES)
 # ==========================================
 def obtener_columnas():
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute("PRAGMA table_info(paquetes)")
     columnas = [col[1] for col in cursor.fetchall()]
@@ -142,7 +151,7 @@ def formatear_paquete(fila, columnas):
     return datos
 
 def buscar_por_dpi_y_numero(dpi, num_paquete):
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     columnas = obtener_columnas()
     cursor.execute("SELECT * FROM paquetes WHERE usuario_codigo = ? AND num_paquete = ?", (dpi, num_paquete))
@@ -151,7 +160,7 @@ def buscar_por_dpi_y_numero(dpi, num_paquete):
     return formatear_paquete(fila, columnas) if fila else None
 
 def buscar_por_numero_general(num_general):
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     columnas = obtener_columnas()
     cursor.execute("SELECT * FROM paquetes WHERE numero_general = ?", (num_general,))
@@ -160,7 +169,7 @@ def buscar_por_numero_general(num_general):
     return formatear_paquete(fila, columnas) if fila else None
 
 def buscar_por_usuario(dpi):
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     columnas = obtener_columnas()
     cursor.execute("SELECT * FROM paquetes WHERE usuario_codigo = ? ORDER BY num_paquete", (dpi,))
@@ -169,7 +178,7 @@ def buscar_por_usuario(dpi):
     return [formatear_paquete(f, columnas) for f in filas]
 
 def buscar_por_dpi_y_fecha(dpi, fecha):
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     columnas = obtener_columnas()
     cursor.execute(
@@ -181,7 +190,7 @@ def buscar_por_dpi_y_fecha(dpi, fecha):
     return [formatear_paquete(f, columnas) for f in filas]
 
 def contar_paquetes():
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM paquetes")
     total = cursor.fetchone()[0]
@@ -190,7 +199,7 @@ def contar_paquetes():
 
 def usuario_existe(dpi):
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = conectar_db()
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM usuarios WHERE dpi = ?", (dpi,))
         existe = cursor.fetchone()[0] > 0
@@ -200,7 +209,7 @@ def usuario_existe(dpi):
         return False
 
 def insertar_paquete(dpi, num, f_del, f_al, est, fil, col, pil, general=None):
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     try:
         if general is None or str(general).lower() == "auto":
@@ -233,7 +242,7 @@ def insertar_paquete(dpi, num, f_del, f_al, est, fil, col, pil, general=None):
         conn.close()
 
 def eliminar_paquete(dpi, num):
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM paquetes WHERE usuario_codigo = ? AND num_paquete = ?", (dpi, num))
     filas = cursor.rowcount
@@ -245,7 +254,7 @@ def actualizar_paquete(dpi, num, campo, valor):
     campos_validos = ["fecha_del", "fecha_al", "estanteria", "fila", "columna", "pila", "numero_general"]
     if campo not in campos_validos:
         return False
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     try:
         if campo == "numero_general":
@@ -268,7 +277,7 @@ def actualizar_paquete(dpi, num, campo, valor):
         return False
 
 def agregar_usuario(dpi, nombre):
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     try:
         cursor.execute("INSERT INTO usuarios (dpi, nombre) VALUES (?, ?)", (dpi, nombre))
@@ -280,7 +289,7 @@ def agregar_usuario(dpi, nombre):
         conn.close()
 
 def listar_usuarios():
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute("SELECT dpi, nombre FROM usuarios ORDER BY nombre")
     usuarios = cursor.fetchall()
@@ -288,7 +297,7 @@ def listar_usuarios():
     return usuarios
 
 def eliminar_usuario(dpi):
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM usuarios WHERE dpi = ?", (dpi,))
     filas = cursor.rowcount
@@ -297,7 +306,7 @@ def eliminar_usuario(dpi):
     return filas > 0
 
 def contar_paquetes_de_usuario(dpi):
-    conn = sqlite3.connect(DB_NAME)
+    conn = conectar_db()
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM paquetes WHERE usuario_codigo = ?", (dpi,))
     total = cursor.fetchone()[0]
@@ -378,22 +387,20 @@ def generar_pdf_etiqueta(dpi, fecha_del, fecha_al, num, num_gen, ubicacion):
         y_inicio = margen_sup
         ancho_alto = 70
         
-        # ==================== ETIQUETA ANCHA ====================
+        # ETIQUETA ANCHA
         pdf.set_draw_color(0, 0, 0)
         pdf.set_line_width(0.8)
         pdf.rect(x_ancha, y_inicio, ancho_ancha, ancho_alto)
         
-        # Encabezado gris
         pdf.set_fill_color(221, 221, 221)
         pdf.rect(x_ancha, y_inicio, ancho_ancha, 12, style="F")
         pdf.set_xy(x_ancha, y_inicio + 2)
-        pdf.set_font("Helvetica", "B", 20) # Usamos Helvetica
+        pdf.set_font("Helvetica", "B", 20)
         pdf.cell(ancho_ancha, 8, dpi, align="C")
         
         pdf.set_line_width(0.8)
         pdf.line(x_ancha, y_inicio + 12, x_ancha + ancho_ancha, y_inicio + 12)
         
-        # Fechas
         pdf.set_xy(x_ancha + 3, y_inicio + 14)
         pdf.set_font("Helvetica", "B", 16)
         pdf.cell(ancho_ancha - 6, 8, f"DEL: {del_mostrar}", align="L")
@@ -403,12 +410,10 @@ def generar_pdf_etiqueta(dpi, fecha_del, fecha_al, num, num_gen, ubicacion):
         
         pdf.line(x_ancha, y_inicio + 30, x_ancha + ancho_ancha, y_inicio + 30)
         
-        # Número Grande
         pdf.set_xy(x_ancha, y_inicio + 33)
         pdf.set_font("Helvetica", "B", 38)
         pdf.cell(ancho_ancha, 18, f"No. {num_str}", align="C")
         
-        # Número general
         pdf.set_xy(x_ancha + 3, y_inicio + 52)
         pdf.set_font("Helvetica", "", 9)
         pdf.set_text_color(85, 85, 85)
@@ -417,19 +422,18 @@ def generar_pdf_etiqueta(dpi, fecha_del, fecha_al, num, num_gen, ubicacion):
         
         pdf.line(x_ancha, y_inicio + 58, x_ancha + ancho_ancha, y_inicio + 58)
         
-        # Ubicación
         pdf.set_xy(x_ancha, y_inicio + 60)
         pdf.set_font("Helvetica", "", 14)
         pdf.cell(ancho_ancha, 8, f"Ubicación: {ubicacion}", align="C")
         
-        # ==================== LÍNEA DE CORTE ====================
+        # LÍNEA DE CORTE
         pdf.set_line_width(0.5)
         y_actual = y_inicio
         while y_actual < y_inicio + ancho_alto:
             pdf.line(x_sep + ancho_sep / 2, y_actual, x_sep + ancho_sep / 2, y_actual + 2)
             y_actual += 4
         
-        # ==================== ETIQUETA ANGOSTA ====================
+        # ETIQUETA ANGOSTA
         pdf.set_line_width(0.8)
         pdf.rect(x_angosta, y_inicio, ancho_angosta, ancho_alto)
         
@@ -502,7 +506,6 @@ async def verificar_acceso(update, roles_permitidos=None):
 # ==========================================
 
 def obtener_menu_principal(usuario):
-    """Menú principal con los 5 botones grandes."""
     rol = usuario["rol"]
     
     teclado = [
@@ -510,11 +513,9 @@ def obtener_menu_principal(usuario):
         [InlineKeyboardButton("✏️ EDICIÓN", callback_data="menu_edicion")]
     ]
     
-    # Solo admin y operadores ven gestión de usuarios (tabla usuarios)
     if rol in ["admin", "operador1"]:
         teclado.append([InlineKeyboardButton("👥 GESTIÓN", callback_data="menu_gestion")])
         
-    # Solo admin ve autorización de Telegram
     if rol == "admin":
         teclado.append([InlineKeyboardButton("🔐 AUTORIZACIÓN", callback_data="menu_autorizacion")])
         
@@ -523,7 +524,6 @@ def obtener_menu_principal(usuario):
     return InlineKeyboardMarkup(teclado)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra el nuevo menú interactivo principal."""
     usuario = await verificar_acceso(update)
     if not usuario:
         return
@@ -542,7 +542,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(mensaje, reply_markup=teclado, parse_mode="Markdown")
 
 async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja las acciones de los botones (Menú principal y sub-menús)."""
     query = update.callback_query
     await query.answer()
     
@@ -551,11 +550,8 @@ async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     accion = query.data
-    
-    # Botón para volver al menú principal
     btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
 
-    # ==================== MENÚ PRINCIPAL ====================
     if accion == "menu_inicio":
         await start(update, context)
         
@@ -569,7 +565,6 @@ async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
 
-    # ==================== SUB-MENÚ: CONSULTAS ====================
     elif accion == "menu_consulta":
         texto = (
             "🔍 *MENÚ DE CONSULTAS*\n\n"
@@ -587,7 +582,6 @@ async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
 
-    # ==================== SUB-MENÚ: EDICIÓN ====================
     elif accion == "menu_edicion":
         texto = (
             "✏️ *MENÚ DE EDICIÓN*\n\n"
@@ -603,7 +597,6 @@ async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
 
-    # ==================== SUB-MENÚ: GESTIÓN ====================
     elif accion == "menu_gestion":
         if usuario["rol"] not in ["admin", "operador1"]:
             await query.answer("No tienes permiso para ver esto.", show_alert=True)
@@ -621,7 +614,6 @@ async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
 
-    # ==================== SUB-MENÚ: AUTORIZACIÓN ====================
     elif accion == "menu_autorizacion":
         if usuario["rol"] != "admin":
             await query.answer("Solo el admin puede ver esto.", show_alert=True)
@@ -640,9 +632,9 @@ async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Modifica el rol de un usuario."
         )
         await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
-        
+
 # ==========================================
-# COMANDOS DE TEXTO (Los que ya tenías)
+# COMANDOS DE TEXTO
 # ==========================================
 async def mi_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🆔 Tu ID de Telegram es: `{update.effective_user.id}`", parse_mode="Markdown")
@@ -915,7 +907,6 @@ async def usuario_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     dpi = context.args[0].strip()
     
-    # Si es operador2, solo puede consultar su propio DPI
     if usuario["rol"] == "operador2" and dpi != usuario["dpi_asignado"]:
         await update.message.reply_text(f"🚫 Solo puedes consultar tu propio DPI: `{usuario['dpi_asignado']}`", parse_mode="Markdown")
         return
@@ -1051,7 +1042,6 @@ def health_check():
     return "Bot is running!"
 
 if __name__ == "__main__":
-    # 1. Iniciar Flask en un hilo secundario (para que Render detecte el puerto)
     def iniciar_flask():
         import os
         puerto = int(os.environ.get("PORT", 8080))
@@ -1061,13 +1051,11 @@ if __name__ == "__main__":
     hilo_flask.daemon = True
     hilo_flask.start()
 
-    # 2. Iniciar el bot en el hilo principal (obligatorio)
     print("🤖 Iniciando bot...")
     inicializar_tabla_telegram()
     
     app = Application.builder().token(TOKEN).build()
     
-    # Comandos de texto
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("mi_id", mi_id))
@@ -1083,14 +1071,11 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("usuarios", usuarios))
     app.add_handler(CommandHandler("eliminar_usuario", eliminar_usuario_cmd))  
     
-    # Comandos de Admin
     app.add_handler(CommandHandler("autorizar", autorizar))
     app.add_handler(CommandHandler("lista_autorizados", lista_autorizados))
     
-    # Botones del menú interactivo
     app.add_handler(CallbackQueryHandler(botones_menu))
     
-    # Flujo de registro paso a paso
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("registrar", registrar_inicio)],
         states={
@@ -1110,8 +1095,4 @@ if __name__ == "__main__":
     app.add_handler(conv_handler)
     
     print("✅ Bot activo. Presiona /start en Telegram.")
-    
-    # 3. Encender el bot
     app.run_polling()
-
-
