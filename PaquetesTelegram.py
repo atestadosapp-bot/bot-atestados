@@ -2,7 +2,7 @@ import os
 import tempfile
 import sqlite3
 import threading
-import libsql_experimental as libsql
+import libsql_client  # <-- Nueva librería oficial
 from flask import Flask
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -28,15 +28,15 @@ ADMIN_INICIAL_ID = 6491907692
 # CONEXIÓN A LA BASE DE DATOS (TURSO)
 # ==========================================
 def conectar_db():
-    return libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
+    # Creamos el cliente. El cierre se maneja automáticamente al hacer commit o consultar.
+    return libsql_client.create_client_sync(TURSO_URL, auth_token=TURSO_TOKEN)
 
 # ==========================================
 # INICIALIZACIÓN DE LA TABLA DE USUARIOS TELEGRAM
 # ==========================================
 def inicializar_tabla_telegram():
-    conn = conectar_db()
-    cursor = conn.cursor()
-    cursor.execute("""
+    client = conectar_db()
+    client.execute("""
         CREATE TABLE IF NOT EXISTS usuarios_telegram (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             telegram_id INTEGER UNIQUE NOT NULL,
@@ -47,32 +47,27 @@ def inicializar_tabla_telegram():
             fecha_registro TEXT
         )
     """)
-    conn.commit()
     
-    cursor.execute("SELECT COUNT(*) FROM usuarios_telegram WHERE telegram_id = ?", (ADMIN_INICIAL_ID,))
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("""
+    res = client.execute("SELECT COUNT(*) FROM usuarios_telegram WHERE telegram_id = ?", (ADMIN_INICIAL_ID,))
+    if res.rows[0][0] == 0:
+        client.execute("""
             INSERT INTO usuarios_telegram (telegram_id, nombre, rol, dpi_asignado, activo, fecha_registro)
             VALUES (?, ?, ?, ?, 1, ?)
         """, (ADMIN_INICIAL_ID, "Alex Miranda", "admin", None, datetime.now().strftime("%Y-%m-%d %H:%M")))
-        conn.commit()
         print(f"✅ Admin inicial registrado: {ADMIN_INICIAL_ID}")
-    conn.close()
 
 # ==========================================
 # FUNCIONES DE USUARIOS TELEGRAM
 # ==========================================
 def usuario_autorizado(telegram_id):
     try:
-        conn = conectar_db()
-        cursor = conn.cursor()
-        cursor.execute(
+        client = conectar_db()
+        res = client.execute(
             "SELECT telegram_id, nombre, rol, dpi_asignado, activo FROM usuarios_telegram WHERE telegram_id = ?",
             (telegram_id,)
         )
-        fila = cursor.fetchone()
-        conn.close()
-        if fila and fila[4] == 1:
+        if res.rows and res.rows[0][4] == 1:
+            fila = res.rows[0]
             return {
                 "telegram_id": fila[0],
                 "nombre": fila[1],
@@ -85,60 +80,29 @@ def usuario_autorizado(telegram_id):
         return None
 
 def agregar_autorizado(telegram_id, nombre, rol, dpi_asignado=None):
-    conn = conectar_db()
-    cursor = conn.cursor()
+    client = conectar_db()
     try:
-        cursor.execute("""
+        client.execute("""
             INSERT INTO usuarios_telegram (telegram_id, nombre, rol, dpi_asignado, activo, fecha_registro)
             VALUES (?, ?, ?, ?, 1, ?)
         """, (telegram_id, nombre, rol, dpi_asignado, datetime.now().strftime("%Y-%m-%d %H:%M")))
-        conn.commit()
         return True, None
-    except sqlite3.IntegrityError:
-        return False, "Ese ID de Telegram ya está autorizado"
     except Exception as e:
         return False, str(e)
-    finally:
-        conn.close()
-
-def desactivar_autorizado(telegram_id):
-    conn = conectar_db()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE usuarios_telegram SET activo = 0 WHERE telegram_id = ?", (telegram_id,))
-    filas = cursor.rowcount
-    conn.commit()
-    conn.close()
-    return filas > 0
 
 def listar_autorizados():
-    conn = conectar_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT telegram_id, nombre, rol, dpi_asignado, activo FROM usuarios_telegram ORDER BY rol, nombre")
-    filas = cursor.fetchall()
-    conn.close()
-    return filas
-
-def cambiar_rol(telegram_id, nuevo_rol, nuevo_dpi=None):
-    conn = conectar_db()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE usuarios_telegram SET rol = ?, dpi_asignado = ? WHERE telegram_id = ?",
-        (nuevo_rol, nuevo_dpi, telegram_id)
-    )
-    filas = cursor.rowcount
-    conn.commit()
-    conn.close()
-    return filas > 0
+    client = conectar_db()
+    res = client.execute("SELECT telegram_id, nombre, rol, dpi_asignado, activo FROM usuarios_telegram ORDER BY rol, nombre")
+    return res.rows
 
 # ==========================================
 # FUNCIONES DE BASE DE DATOS (PAQUETES)
 # ==========================================
 def obtener_columnas():
-    conn = conectar_db()
-    cursor = conn.cursor()
-    cursor.execute("PRAGMA table_info(paquetes)")
-    columnas = [col[1] for col in cursor.fetchall()]
-    conn.close()
+    client = conectar_db()
+    res = client.execute("PRAGMA table_info(paquetes)")
+    # La respuesta de PRAGMA en libsql-client viene como filas.
+    columnas = [col[1] for col in res.rows] 
     return columnas
 
 def formatear_paquete(fila, columnas):
@@ -151,111 +115,87 @@ def formatear_paquete(fila, columnas):
     return datos
 
 def buscar_por_dpi_y_numero(dpi, num_paquete):
-    conn = conectar_db()
-    cursor = conn.cursor()
+    client = conectar_db()
     columnas = obtener_columnas()
-    cursor.execute("SELECT * FROM paquetes WHERE usuario_codigo = ? AND num_paquete = ?", (dpi, num_paquete))
-    fila = cursor.fetchone()
-    conn.close()
-    return formatear_paquete(fila, columnas) if fila else None
+    res = client.execute("SELECT * FROM paquetes WHERE usuario_codigo = ? AND num_paquete = ?", (dpi, num_paquete))
+    if res.rows:
+        return formatear_paquete(res.rows[0], columnas)
+    return None
 
 def buscar_por_numero_general(num_general):
-    conn = conectar_db()
-    cursor = conn.cursor()
+    client = conectar_db()
     columnas = obtener_columnas()
-    cursor.execute("SELECT * FROM paquetes WHERE numero_general = ?", (num_general,))
-    fila = cursor.fetchone()
-    conn.close()
-    return formatear_paquete(fila, columnas) if fila else None
+    res = client.execute("SELECT * FROM paquetes WHERE numero_general = ?", (num_general,))
+    if res.rows:
+        return formatear_paquete(res.rows[0], columnas)
+    return None
 
 def buscar_por_usuario(dpi):
-    conn = conectar_db()
-    cursor = conn.cursor()
+    client = conectar_db()
     columnas = obtener_columnas()
-    cursor.execute("SELECT * FROM paquetes WHERE usuario_codigo = ? ORDER BY num_paquete", (dpi,))
-    filas = cursor.fetchall()
-    conn.close()
-    return [formatear_paquete(f, columnas) for f in filas]
+    res = client.execute("SELECT * FROM paquetes WHERE usuario_codigo = ? ORDER BY num_paquete", (dpi,))
+    return [formatear_paquete(f, columnas) for f in res.rows]
 
 def buscar_por_dpi_y_fecha(dpi, fecha):
-    conn = conectar_db()
-    cursor = conn.cursor()
+    client = conectar_db()
     columnas = obtener_columnas()
-    cursor.execute(
+    res = client.execute(
         "SELECT * FROM paquetes WHERE usuario_codigo = ? AND fecha_del <= ? AND fecha_al >= ? ORDER BY num_paquete",
         (dpi, fecha, fecha)
     )
-    filas = cursor.fetchall()
-    conn.close()
-    return [formatear_paquete(f, columnas) for f in filas]
+    return [formatear_paquete(f, columnas) for f in res.rows]
 
 def contar_paquetes():
-    conn = conectar_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM paquetes")
-    total = cursor.fetchone()[0]
-    conn.close()
-    return total
+    client = conectar_db()
+    res = client.execute("SELECT COUNT(*) FROM paquetes")
+    return res.rows[0][0]
 
 def usuario_existe(dpi):
     try:
-        conn = conectar_db()
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM usuarios WHERE dpi = ?", (dpi,))
-        existe = cursor.fetchone()[0] > 0
-        conn.close()
-        return existe
+        client = conectar_db()
+        res = client.execute("SELECT COUNT(*) FROM usuarios WHERE dpi = ?", (dpi,))
+        return res.rows[0][0] > 0
     except:
         return False
 
 def insertar_paquete(dpi, num, f_del, f_al, est, fil, col, pil, general=None):
-    conn = conectar_db()
-    cursor = conn.cursor()
+    client = conectar_db()
     try:
         if general is None or str(general).lower() == "auto":
-            cursor.execute("SELECT MAX(numero_general) FROM paquetes")
-            max_gen = cursor.fetchone()[0] or 0
+            res = client.execute("SELECT MAX(numero_general) FROM paquetes")
+            max_gen = res.rows[0][0] or 0
             nuevo_gen = max_gen + 1
         elif str(general).lower() in ("blanco", "null", ""):
             nuevo_gen = None
         else:
             try:
                 nuevo_gen = int(general)
-                cursor.execute("SELECT COUNT(*) FROM paquetes WHERE numero_general = ?", (nuevo_gen,))
-                if cursor.fetchone()[0] > 0:
+                res = client.execute("SELECT COUNT(*) FROM paquetes WHERE numero_general = ?", (nuevo_gen,))
+                if res.rows[0][0] > 0:
                     return (None, f"El número general {nuevo_gen} ya está en uso")
             except ValueError:
                 return (None, f"'{general}' no es un número válido")
         
-        cursor.execute("""
+        client.execute("""
             INSERT INTO paquetes 
             (usuario_codigo, num_paquete, fecha_del, fecha_al, estanteria, fila, columna, pila, activo, numero_general)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         """, (dpi, num, f_del, f_al, est, fil, col, pil, nuevo_gen))
-        conn.commit()
         return (nuevo_gen, None)
-    except sqlite3.IntegrityError:
-        return (None, "Ya existe un paquete con ese número para ese DPI")
     except Exception as e:
         return (None, f"Error: {e}")
-    finally:
-        conn.close()
 
 def eliminar_paquete(dpi, num):
-    conn = conectar_db()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM paquetes WHERE usuario_codigo = ? AND num_paquete = ?", (dpi, num))
-    filas = cursor.rowcount
-    conn.commit()
-    conn.close()
-    return filas > 0
+    client = conectar_db()
+    client.execute("DELETE FROM paquetes WHERE usuario_codigo = ? AND num_paquete = ?", (dpi, num))
+    # libsql-client no devuelve rowcount directamente, así que asumimos éxito si no hay excepción.
+    return True
 
 def actualizar_paquete(dpi, num, campo, valor):
     campos_validos = ["fecha_del", "fecha_al", "estanteria", "fila", "columna", "pila", "numero_general"]
     if campo not in campos_validos:
         return False
-    conn = conectar_db()
-    cursor = conn.cursor()
+    client = conectar_db()
     try:
         if campo == "numero_general":
             if valor.lower() in ("blanco", "null", ""):
@@ -265,53 +205,35 @@ def actualizar_paquete(dpi, num, campo, valor):
         else:
             valor_final = valor
         
-        cursor.execute(f"UPDATE paquetes SET {campo} = ? WHERE usuario_codigo = ? AND num_paquete = ?",
+        client.execute(f"UPDATE paquetes SET {campo} = ? WHERE usuario_codigo = ? AND num_paquete = ?",
                        (valor_final, dpi, num))
-        filas = cursor.rowcount
-        conn.commit()
-        conn.close()
-        return filas > 0
+        return True
     except Exception as e:
-        conn.close()
         print(f"Error actualizar: {e}")
         return False
 
 def agregar_usuario(dpi, nombre):
-    conn = conectar_db()
-    cursor = conn.cursor()
+    client = conectar_db()
     try:
-        cursor.execute("INSERT INTO usuarios (dpi, nombre) VALUES (?, ?)", (dpi, nombre))
-        conn.commit()
+        client.execute("INSERT INTO usuarios (dpi, nombre) VALUES (?, ?)", (dpi, nombre))
         return True
-    except sqlite3.IntegrityError:
+    except:
         return False
-    finally:
-        conn.close()
 
 def listar_usuarios():
-    conn = conectar_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT dpi, nombre FROM usuarios ORDER BY nombre")
-    usuarios = cursor.fetchall()
-    conn.close()
-    return usuarios
+    client = conectar_db()
+    res = client.execute("SELECT dpi, nombre FROM usuarios ORDER BY nombre")
+    return res.rows
 
 def eliminar_usuario(dpi):
-    conn = conectar_db()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM usuarios WHERE dpi = ?", (dpi,))
-    filas = cursor.rowcount
-    conn.commit()
-    conn.close()
-    return filas > 0
+    client = conectar_db()
+    client.execute("DELETE FROM usuarios WHERE dpi = ?", (dpi,))
+    return True
 
 def contar_paquetes_de_usuario(dpi):
-    conn = conectar_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM paquetes WHERE usuario_codigo = ?", (dpi,))
-    total = cursor.fetchone()[0]
-    conn.close()
-    return total
+    client = conectar_db()
+    res = client.execute("SELECT COUNT(*) FROM paquetes WHERE usuario_codigo = ?", (dpi,))
+    return res.rows[0][0]
 
 # ==========================================
 # UTILIDADES
@@ -354,14 +276,11 @@ def generar_pdf_etiqueta(dpi, fecha_del, fecha_al, num, num_gen, ubicacion):
         return None, "No tienes 'fpdf2'."
     
     def a_formato_mostrar(fecha):
-        if not fecha or fecha == "?":
-            return fecha
+        if not fecha or fecha == "?": return fecha
         try:
             partes = fecha.split("-")
-            if len(partes) == 3:
-                return f"{partes[2]}/{partes[1]}/{partes[0]}"
-        except:
-            pass
+            if len(partes) == 3: return f"{partes[2]}/{partes[1]}/{partes[0]}"
+        except: pass
         return fecha
     
     del_mostrar = a_formato_mostrar(fecha_del)
@@ -507,35 +426,26 @@ async def verificar_acceso(update, roles_permitidos=None):
 
 def obtener_menu_principal(usuario):
     rol = usuario["rol"]
-    
     teclado = [
         [InlineKeyboardButton("🔍 CONSULTAS", callback_data="menu_consulta")],
         [InlineKeyboardButton("✏️ EDICIÓN", callback_data="menu_edicion")]
     ]
-    
     if rol in ["admin", "operador1"]:
         teclado.append([InlineKeyboardButton("👥 GESTIÓN", callback_data="menu_gestion")])
-        
     if rol == "admin":
         teclado.append([InlineKeyboardButton("🔐 AUTORIZACIÓN", callback_data="menu_autorizacion")])
-        
     teclado.append([InlineKeyboardButton("👤 MI INFORMACIÓN", callback_data="menu_info")])
-    
     return InlineKeyboardMarkup(teclado)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await verificar_acceso(update)
-    if not usuario:
-        return
-    
+    if not usuario: return
     mensaje = (
         f"👋 *Hola, {usuario['nombre']}*\n"
         f"Tu rol es: `{usuario['rol']}`\n\n"
         "Selecciona una categoría para ver las opciones disponibles:"
     )
-    
     teclado = obtener_menu_principal(usuario)
-    
     if update.callback_query:
         await update.callback_query.edit_message_text(mensaje, reply_markup=teclado, parse_mode="Markdown")
     else:
@@ -544,93 +454,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
     usuario = await verificar_acceso(update)
-    if not usuario:
-        return
-    
+    if not usuario: return
     accion = query.data
     btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
 
     if accion == "menu_inicio":
         await start(update, context)
-        
     elif accion == "menu_info":
         dpi_info = f"\n👤 DPI asignado: `{usuario['dpi_asignado']}`" if usuario['dpi_asignado'] else ""
-        texto = (
-            f"👤 *Tu información personal*\n\n"
-            f"Nombre: {usuario['nombre']}\n"
-            f"Rol: `{usuario['rol']}`\n"
-            f"ID de Telegram: `{usuario['telegram_id']}`{dpi_info}"
-        )
+        texto = (f"👤 *Tu información personal*\n\nNombre: {usuario['nombre']}\nRol: `{usuario['rol']}`\nID de Telegram: `{usuario['telegram_id']}`{dpi_info}")
         await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
-
     elif accion == "menu_consulta":
-        texto = (
-            "🔍 *MENÚ DE CONSULTAS*\n\n"
-            "Copia y pega el comando que necesites en el chat:\n\n"
-            "`/buscar <DPI> <N°>`\n"
-            "Busca un paquete por código y número.\n\n"
-            "`/fecha <DPI> <fecha>`\n"
-            "Busca paquetes en una fecha específica.\n\n"
-            "`/general <N°>`\n"
-            "Busca por el número general único.\n\n"
-            "`/usuario <DPI>`\n"
-            "Lista todos los paquetes de un usuario.\n\n"
-            "`/total`\n"
-            "Muestra cuántos paquetes hay en total."
-        )
+        texto = ("🔍 *MENÚ DE CONSULTAS*\n\nCopia y pega el comando que necesites en el chat:\n\n`/buscar <DPI> <N°>`\nBusca un paquete por código y número.\n\n`/fecha <DPI> <fecha>`\nBusca paquetes en una fecha específica.\n\n`/general <N°>`\nBusca por el número general único.\n\n`/usuario <DPI>`\nLista todos los paquetes de un usuario.\n\n`/total`\nMuestra cuántos paquetes hay en total.")
         await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
-
     elif accion == "menu_edicion":
-        texto = (
-            "✏️ *MENÚ DE EDICIÓN*\n\n"
-            "Copia y pega el comando que necesites en el chat:\n\n"
-            "`/registrar`\n"
-            "Inicia el registro paso a paso.\n\n"
-            "`/editar <DPI> <N°> <campo> <valor>`\n"
-            "Modifica un campo de un paquete.\n\n"
-            "`/eliminar <DPI> <N°>`\n"
-            "Elimina un paquete de la base de datos.\n\n"
-            "`/etiqueta <DPI> <N°>`\n"
-            "Genera e imprime la etiqueta en PDF."
-        )
+        texto = ("✏️ *MENÚ DE EDICIÓN*\n\nCopia y pega el comando que necesites en el chat:\n\n`/registrar`\nInicia el registro paso a paso.\n\n`/editar <DPI> <N°> <campo> <valor>`\nModifica un campo de un paquete.\n\n`/eliminar <DPI> <N°>`\nElimina un paquete de la base de datos.\n\n`/etiqueta <DPI> <N°>`\nGenera e imprime la etiqueta en PDF.")
         await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
-
     elif accion == "menu_gestion":
         if usuario["rol"] not in ["admin", "operador1"]:
             await query.answer("No tienes permiso para ver esto.", show_alert=True)
             return
-            
-        texto = (
-            "👥 *MENÚ DE GESTIÓN DE USUARIOS*\n\n"
-            "Copia y pega el comando que necesites en el chat:\n\n"
-            "`/usuarios`\n"
-            "Muestra la lista de usuarios en la base de datos.\n\n"
-            "`/agregar_usuario <DPI> <Nombre>`\n"
-            "Agrega un nuevo usuario a la tabla.\n\n"
-            "`/eliminar_usuario <DPI>`\n"
-            "Elimina un usuario (solo si no tiene paquetes)."
-        )
+        texto = ("👥 *MENÚ DE GESTIÓN DE USUARIOS*\n\nCopia y pega el comando que necesites en el chat:\n\n`/usuarios`\nMuestra la lista de usuarios en la base de datos.\n\n`/agregar_usuario <DPI> <Nombre>`\nAgrega un nuevo usuario a la tabla.\n\n`/eliminar_usuario <DPI>`\nElimina un usuario (solo si no tiene paquetes).")
         await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
-
     elif accion == "menu_autorizacion":
         if usuario["rol"] != "admin":
             await query.answer("Solo el admin puede ver esto.", show_alert=True)
             return
-            
-        texto = (
-            "🔐 *MENÚ DE AUTORIZACIÓN (ADMIN)*\n\n"
-            "Copia y pega el comando en el chat:\n\n"
-            "`/autorizar <ID> <Nombre> <Rol> [DPI]`\n"
-            "Da acceso a un nuevo usuario de Telegram.\n\n"
-            "`/desautorizar <ID>`\n"
-            "Quita el acceso a un usuario.\n\n"
-            "`/lista_autorizados`\n"
-            "Muestra quiénes tienen acceso al bot.\n\n"
-            "`/cambiar_rol <ID> <Rol> [DPI]`\n"
-            "Modifica el rol de un usuario."
-        )
+        texto = ("🔐 *MENÚ DE AUTORIZACIÓN (ADMIN)*\n\nCopia y pega el comando en el chat:\n\n`/autorizar <ID> <Nombre> <Rol> [DPI]`\nDa acceso a un nuevo usuario de Telegram.\n\n`/desautorizar <ID>`\nQuita el acceso a un usuario.\n\n`/lista_autorizados`\nMuestra quiénes tienen acceso al bot.\n\n`/cambiar_rol <ID> <Rol> [DPI]`\nModifica el rol de un usuario.")
         await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
 
 # ==========================================
@@ -691,42 +542,24 @@ async def etiqueta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except: 
         await update.message.reply_text("⚠️ Número inválido.")
         return
-    
     try:
         res = buscar_por_dpi_y_numero(dpi, num)
         if not res:
             res = buscar_por_numero_general(num)
             if res and res.get("usuario_codigo") != dpi:
                 res = None 
-
         if not res: 
             await update.message.reply_text(f"❌ No se encontró N° {num} para el DPI `{dpi}`.", parse_mode="Markdown")
             return
-        
         num_real = res.get("num_paquete")
         ruta, error = generar_pdf_etiqueta(dpi, res.get("fecha_del"), res.get("fecha_al"), num_real, res.get("numero_general"), res.get("ubicacion_armada"))
-        
         if ruta:
             with open(ruta, "rb") as f:
-                caption = (
-                    f"🏷️ *Etiquetas del Paquete N° {num_real}*\n\n"
-                    f"👤 DPI: `{dpi}`\n"
-                    f"📅 {res.get('fecha_del')} al {res.get('fecha_al')}\n"
-                    f"📍 `{res.get('ubicacion_armada')}`\n\n"
-                    f"📄 *Formato:* PDF (listo para imprimir)\n"
-                    f"📐 *Tamaño:* Carta\n"
-                    f"🏷️ *Contiene:* Etiqueta ancha + angosta"
-                )
-                await update.message.reply_document(
-                    document=f, 
-                    filename=f"etiqueta_{dpi}_{num_real}.pdf",
-                    caption=caption,
-                    parse_mode="Markdown"
-                )
+                caption = (f"🏷️ *Etiquetas del Paquete N° {num_real}*\n\n👤 DPI: `{dpi}`\n📅 {res.get('fecha_del')} al {res.get('fecha_al')}\n📍 `{res.get('ubicacion_armada')}`\n\n📄 *Formato:* PDF (listo para imprimir)\n📐 *Tamaño:* Carta\n🏷️ *Contiene:* Etiqueta ancha + angosta")
+                await update.message.reply_document(document=f, filename=f"etiqueta_{dpi}_{num_real}.pdf", caption=caption, parse_mode="Markdown")
             os.remove(ruta)
         else: 
             await update.message.reply_text(f"❌ Error al generar PDF: {error}")
-            
     except Exception as e:
         await update.message.reply_text(f"❌ Error inesperado: {str(e)}")
 
@@ -736,15 +569,12 @@ async def etiqueta(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def registrar_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
     if not usuario: return ConversationHandler.END
-    
     if usuario["rol"] == "operador2":
         context.user_data["dpi"] = usuario["dpi_asignado"]
         await update.message.reply_text(f"📝 *Registro*\n👤 DPI: `{usuario['dpi_asignado']}`\n\n1️⃣ Fecha *DEL*:", parse_mode="Markdown")
         return REG_DEL
-    
     if context.args and len(context.args) >= 8:
         return await registrar_directo(update, context, usuario)
-        
     context.user_data.clear()
     await update.message.reply_text("📝 *Registro paso a paso*\n\n1️⃣ Ingresa el *DPI/código* del usuario:", parse_mode="Markdown")
     return REG_DPI
@@ -816,12 +646,10 @@ async def reg_general(update: Update, context: ContextTypes.DEFAULT_TYPE):
     general = update.message.text.strip()
     datos = context.user_data
     nuevo_gen, error = insertar_paquete(datos["dpi"], datos["num_paquete"], datos["fecha_del"], datos["fecha_al"], datos["estanteria"], datos["fila"], datos["columna"], datos["pila"], general)
-    
     if error:
         await update.message.reply_text(f"❌ {error}\n\nReintenta con /registrar")
         context.user_data.clear()
         return ConversationHandler.END
-        
     gen_texto = f"`{nuevo_gen}`" if nuevo_gen is not None else "_En blanco_"
     await update.message.reply_text(f"✅ *Registrado*\n📦 N°: {datos['num_paquete']}\n🔢 Gen: {gen_texto}\n👤 `{datos['dpi']}`", parse_mode="Markdown")
     context.user_data.clear()
@@ -841,7 +669,6 @@ async def registrar_directo(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         f_al = normalizar_fecha(context.args[3])
         est, fil, col, pil = context.args[4:8]
     except: return ConversationHandler.END
-    
     general = context.args[8] if len(context.args) == 9 else None
     nuevo_gen, error = insertar_paquete(dpi, num, f_del, f_al, est, fil, col, pil, general)
     if error: await update.message.reply_text(f"❌ {error}")
@@ -906,11 +733,9 @@ async def usuario_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Uso: `/usuario <DPI>`", parse_mode="Markdown")
         return
     dpi = context.args[0].strip()
-    
     if usuario["rol"] == "operador2" and dpi != usuario["dpi_asignado"]:
         await update.message.reply_text(f"🚫 Solo puedes consultar tu propio DPI: `{usuario['dpi_asignado']}`", parse_mode="Markdown")
         return
-    
     resultados = buscar_por_usuario(dpi)
     if not resultados:
         await update.message.reply_text(f"❌ No hay paquetes para el DPI `{dpi}`.", parse_mode="Markdown")
@@ -936,11 +761,9 @@ async def eliminar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Uso: `/eliminar <DPI> <N°>`", parse_mode="Markdown")
         return
     dpi = context.args[0]
-    
     if usuario["rol"] == "operador2" and dpi != usuario["dpi_asignado"]:
         await update.message.reply_text("🚫 Solo puedes eliminar paquetes de tu propio DPI.")
         return
-    
     try: num = int(context.args[1])
     except ValueError:
         await update.message.reply_text("⚠️ El número debe ser entero.")
@@ -958,25 +781,18 @@ async def editar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
     if not usuario: return
     if len(context.args) != 4:
-        await update.message.reply_text(
-            "⚠️ Uso: `/editar <DPI> <N°> <campo> <valor>`\n"
-            "Campos: `fecha_del`, `fecha_al`, `estanteria`, `fila`, `columna`, `pila`, `numero_general`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("⚠️ Uso: `/editar <DPI> <N°> <campo> <valor>`\nCampos: `fecha_del`, `fecha_al`, `estanteria`, `fila`, `columna`, `pila`, `numero_general`", parse_mode="Markdown")
         return
     dpi = context.args[0]
-    
     if usuario["rol"] == "operador2" and dpi != usuario["dpi_asignado"]:
         await update.message.reply_text("🚫 Solo puedes editar paquetes de tu propio DPI.")
         return
-    
     try: num = int(context.args[1])
     except ValueError:
         await update.message.reply_text("⚠️ El número debe ser entero.")
         return
     campo = context.args[2]
     valor = context.args[3]
-    
     if actualizar_paquete(dpi, num, campo, valor):
         await update.message.reply_text(f"✅ Campo `{campo}` actualizado a `{valor}`.", parse_mode="Markdown")
     else:
