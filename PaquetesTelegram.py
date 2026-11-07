@@ -28,8 +28,9 @@ ADMIN_INICIAL_ID = 6491907692
 # CONEXIÓN A LA BASE DE DATOS (TURSO)
 # ==========================================
 def conectar_db():
-    # Creamos el cliente. El cierre se maneja automáticamente al hacer commit o consultar.
-    return libsql_client.create_client_sync(TURSO_URL, auth_token=TURSO_TOKEN)
+    # Convertir libsql:// a https:// para evitar el error de WebSocket
+    url_https = TURSO_URL.replace("libsql://", "https://")
+    return libsql_client.create_client_sync(url_https, auth_token=TURSO_TOKEN)
 
 # ==========================================
 # INICIALIZACIÓN DE LA TABLA DE USUARIOS TELEGRAM
