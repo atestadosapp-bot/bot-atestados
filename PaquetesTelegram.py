@@ -505,7 +505,22 @@ def obtener_menu_principal(usuario):
         
     teclado.append([InlineKeyboardButton("👤 MI INFORMACIÓN", callback_data="menu_info")])
     return InlineKeyboardMarkup(teclado)
-
+    
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update)
+    if not usuario: return
+    mensaje = (
+        f"👋 *Hola, {usuario['nombre']}*\n"
+        f"Tu rol es: `{usuario['rol']}`\n"
+        f"Área: `{usuario.get('area', 'enrolamiento').capitalize()}`\n\n"
+        "Selecciona una categoría:"
+    )
+    teclado = obtener_menu_principal(usuario)
+    if update.callback_query:
+        await update.callback_query.edit_message_text(mensaje, reply_markup=teclado, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(mensaje, reply_markup=teclado, parse_mode="Markdown")
+        
 async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
