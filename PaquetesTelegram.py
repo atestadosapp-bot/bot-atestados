@@ -477,16 +477,27 @@ async def verificar_acceso(update, roles_permitidos=None):
 # INTERFAZ GRÁFICA (MENÚS ADAPTADOS POR ÁREA)
 # ==========================================
 def obtener_menu_principal(usuario):
+def obtener_menu_principal(usuario):
     rol = usuario["rol"]
     area = usuario.get("area", "enrolamiento")
     
     teclado = []
-    if area == "enrolamiento":
-        teclado.append([InlineKeyboardButton("🔍 CONSULTAS DPI", callback_data="menu_consulta_enrol")])
-        teclado.append([InlineKeyboardButton("✏️ EDICIÓN DPI", callback_data="menu_edicion_enrol")])
+    
+    # Si es admin, ve AMBOS menús (Enrolamiento y Registro)
+    if rol == "admin":
+        teclado.append([InlineKeyboardButton("🔍 CONSULTAS DPI (Enrolamiento)", callback_data="menu_consulta_enrol")])
+        teclado.append([InlineKeyboardButton("✏️ EDICIÓN DPI (Enrolamiento)", callback_data="menu_edicion_enrol")])
+        teclado.append([InlineKeyboardButton("📖 CONSULTAS EVENTOS (Registro)", callback_data="menu_consulta_reg")])
+        teclado.append([InlineKeyboardButton("✏️ EDICIÓN EVENTOS (Registro)", callback_data="menu_edicion_reg")])
+    
+    # Si es operador u otro, solo ve el menú de su área asignada
     else:
-        teclado.append([InlineKeyboardButton("📖 CONSULTAS EVENTOS", callback_data="menu_consulta_reg")])
-        teclado.append([InlineKeyboardButton("✏️ EDICIÓN EVENTOS", callback_data="menu_edicion_reg")])
+        if area == "enrolamiento":
+            teclado.append([InlineKeyboardButton("🔍 CONSULTAS DPI", callback_data="menu_consulta_enrol")])
+            teclado.append([InlineKeyboardButton("✏️ EDICIÓN DPI", callback_data="menu_edicion_enrol")])
+        else:
+            teclado.append([InlineKeyboardButton("📖 CONSULTAS EVENTOS", callback_data="menu_consulta_reg")])
+            teclado.append([InlineKeyboardButton("✏️ EDICIÓN EVENTOS", callback_data="menu_edicion_reg")])
     
     if rol in ["admin", "operador1"]:
         teclado.append([InlineKeyboardButton("👥 GESTIÓN", callback_data="menu_gestion")])
@@ -495,21 +506,6 @@ def obtener_menu_principal(usuario):
         
     teclado.append([InlineKeyboardButton("👤 MI INFORMACIÓN", callback_data="menu_info")])
     return InlineKeyboardMarkup(teclado)
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    usuario = await verificar_acceso(update)
-    if not usuario: return
-    mensaje = (
-        f"👋 *Hola, {usuario['nombre']}*\n"
-        f"Tu rol es: `{usuario['rol']}`\n"
-        f"Área: `{usuario.get('area', 'enrolamiento').capitalize()}`\n\n"
-        "Selecciona una categoría:"
-    )
-    teclado = obtener_menu_principal(usuario)
-    if update.callback_query:
-        await update.callback_query.edit_message_text(mensaje, reply_markup=teclado, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(mensaje, reply_markup=teclado, parse_mode="Markdown")
 
 async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
