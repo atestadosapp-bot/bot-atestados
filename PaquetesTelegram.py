@@ -1,8 +1,7 @@
 import os
 import tempfile
-import sqlite3
 import threading
-import libsql_client  # <-- Nueva librería oficial
+import libsql_client
 from flask import Flask
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -18,11 +17,14 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN","")
 TURSO_URL = "libsql://atestados-atestadosapp.aws-us-east-1.turso.io"
 TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "PON_AQUI_TU_TOKEN_SI_PRUEBAS_LOCAL")
 
-# Tu ID de Telegram (admin inicial)
 ADMIN_INICIAL_ID = 6491907692
 
-# Estados para el ConversationHandler de /registrar
+# Estados para el ConversationHandler de /registrar (ENROLAMIENTO)
 (REG_DPI, REG_DEL, REG_AL, REG_NUM, REG_EST, REG_FIL, REG_COL, REG_PIL, REG_GENERAL) = range(9)
+
+# Estados para el flujo de EVENTOS (REGISTRO CIVIL)
+(EV_TIPO, EV_ANIO, EV_NUM, EV_FOLIO_INI, EV_FOLIO_FIN, EV_EST, EV_FIL, EV_COL, EV_PIL) = range(20, 29)
+(EV_BUS_FOLIO,) = range(30, 31)
 
 # ==========================================
 # CONEXIÓN A LA BASE DE DATOS (TURSO)
@@ -32,29 +34,57 @@ def conectar_db():
     return libsql_client.create_client_sync(url_https, auth_token=TURSO_TOKEN)
 
 # ==========================================
-# INICIALIZACIÓN DE LA TABLA DE USUARIOS TELEGRAM
+# INICIALIZACIÓN DE TABLAS
 # ==========================================
 def inicializar_tabla_telegram():
     client = conectar_db()
+    # Agregamos la columna 'area' (por defecto enrolamiento)
     client.execute("""
         CREATE TABLE IF NOT EXISTS usuarios_telegram (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             telegram_id INTEGER UNIQUE NOT NULL,
             nombre TEXT NOT NULL,
             rol TEXT NOT NULL,
+            area TEXT DEFAULT 'enrolamiento',
             dpi_asignado TEXT,
             activo INTEGER DEFAULT 1,
             fecha_registro TEXT
         )
     """)
     
+    # Intentar agregar la columna si la tabla ya existía de antes (por si acaso)
+    try:
+        client.execute("ALTER TABLE usuarios_telegram ADD COLUMN area TEXT DEFAULT 'enrolamiento'")
+    except:
+        pass # Si ya existe, no hace nada
+
     res = client.execute("SELECT COUNT(*) FROM usuarios_telegram WHERE telegram_id = ?", (ADMIN_INICIAL_ID,))
     if res.rows[0][0] == 0:
         client.execute("""
-            INSERT INTO usuarios_telegram (telegram_id, nombre, rol, dpi_asignado, activo, fecha_registro)
-            VALUES (?, ?, ?, ?, 1, ?)
-        """, (ADMIN_INICIAL_ID, "Alex Miranda", "admin", None, datetime.now().strftime("%Y-%m-%d %H:%M")))
+            INSERT INTO usuarios_telegram (telegram_id, nombre, rol, area, dpi_asignado, activo, fecha_registro)
+            VALUES (?, ?, ?, ?, ?, 1, ?)
+        """, (ADMIN_INICIAL_ID, "Alex Miranda", "admin", "enrolamiento", None, datetime.now().strftime("%Y-%m-%d %H:%M")))
         print(f"✅ Admin inicial registrado: {ADMIN_INICIAL_ID}")
+
+def inicializar_tabla_eventos():
+    client = conectar_db()
+    client.execute("""
+        CREATE TABLE IF NOT EXISTS eventos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tipo_evento TEXT NOT NULL,
+            anio INTEGER NOT NULL,
+            num_paquete INTEGER NOT NULL,
+            folio_inicio INTEGER NOT NULL,
+            folio_fin INTEGER NOT NULL,
+            estanteria TEXT,
+            fila TEXT,
+            columna TEXT,
+            pila TEXT,
+            registrado_por TEXT,
+            fecha_registro TEXT,
+            UNIQUE(tipo_evento, anio, num_paquete)
+        )
+    """)
 
 # ==========================================
 # FUNCIONES DE USUARIOS TELEGRAM
@@ -63,47 +93,46 @@ def usuario_autorizado(telegram_id):
     try:
         client = conectar_db()
         res = client.execute(
-            "SELECT telegram_id, nombre, rol, dpi_asignado, activo FROM usuarios_telegram WHERE telegram_id = ?",
+            "SELECT telegram_id, nombre, rol, area, dpi_asignado, activo FROM usuarios_telegram WHERE telegram_id = ?",
             (telegram_id,)
         )
-        if res.rows and res.rows[0][4] == 1:
+        if res.rows and res.rows[0][5] == 1:
             fila = res.rows[0]
             return {
                 "telegram_id": fila[0],
                 "nombre": fila[1],
                 "rol": fila[2],
-                "dpi_asignado": fila[3]
+                "area": fila[3] if fila[3] else "enrolamiento",
+                "dpi_asignado": fila[4]
             }
         return None
     except Exception as e:
         print(f"Error usuario_autorizado: {e}")
         return None
 
-def agregar_autorizado(telegram_id, nombre, rol, dpi_asignado=None):
+def agregar_autorizado(telegram_id, nombre, rol, area, dpi_asignado=None):
     client = conectar_db()
     try:
         client.execute("""
-            INSERT INTO usuarios_telegram (telegram_id, nombre, rol, dpi_asignado, activo, fecha_registro)
-            VALUES (?, ?, ?, ?, 1, ?)
-        """, (telegram_id, nombre, rol, dpi_asignado, datetime.now().strftime("%Y-%m-%d %H:%M")))
+            INSERT INTO usuarios_telegram (telegram_id, nombre, rol, area, dpi_asignado, activo, fecha_registro)
+            VALUES (?, ?, ?, ?, ?, 1, ?)
+        """, (telegram_id, nombre, rol, area, dpi_asignado, datetime.now().strftime("%Y-%m-%d %H:%M")))
         return True, None
     except Exception as e:
         return False, str(e)
 
 def listar_autorizados():
     client = conectar_db()
-    res = client.execute("SELECT telegram_id, nombre, rol, dpi_asignado, activo FROM usuarios_telegram ORDER BY rol, nombre")
+    res = client.execute("SELECT telegram_id, nombre, rol, area, dpi_asignado, activo FROM usuarios_telegram ORDER BY rol, nombre")
     return res.rows
 
 # ==========================================
-# FUNCIONES DE BASE DE DATOS (PAQUETES)
+# FUNCIONES DE BASE DE DATOS (PAQUETES - ENROLAMIENTO)
 # ==========================================
 def obtener_columnas():
     client = conectar_db()
     res = client.execute("PRAGMA table_info(paquetes)")
-    # La respuesta de PRAGMA en libsql-client viene como filas.
-    columnas = [col[1] for col in res.rows] 
-    return columnas
+    return [col[1] for col in res.rows] 
 
 def formatear_paquete(fila, columnas):
     datos = dict(zip(columnas, fila))
@@ -188,7 +217,6 @@ def insertar_paquete(dpi, num, f_del, f_al, est, fil, col, pil, general=None):
 def eliminar_paquete(dpi, num):
     client = conectar_db()
     client.execute("DELETE FROM paquetes WHERE usuario_codigo = ? AND num_paquete = ?", (dpi, num))
-    # libsql-client no devuelve rowcount directamente, así que asumimos éxito si no hay excepción.
     return True
 
 def actualizar_paquete(dpi, num, campo, valor):
@@ -234,6 +262,31 @@ def contar_paquetes_de_usuario(dpi):
     client = conectar_db()
     res = client.execute("SELECT COUNT(*) FROM paquetes WHERE usuario_codigo = ?", (dpi,))
     return res.rows[0][0]
+
+# ==========================================
+# FUNCIONES DE BASE DE DATOS (EVENTOS - REGISTRO CIVIL)
+# ==========================================
+def insertar_evento(tipo, anio, num_paq, folio_ini, folio_fin, est, fil, col, pil, operador):
+    client = conectar_db()
+    try:
+        client.execute("""
+            INSERT INTO eventos (tipo_evento, anio, num_paquete, folio_inicio, folio_fin, estanteria, fila, columna, pila, registrado_por, fecha_registro)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (tipo, anio, num_paq, folio_ini, folio_fin, est, fil, col, pil, operador, datetime.now().strftime("%Y-%m-%d %H:%M")))
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def buscar_evento_por_folio(folio):
+    client = conectar_db()
+    res = client.execute("""
+        SELECT * FROM eventos 
+        WHERE folio_inicio <= ? AND folio_fin >= ?
+    """, (folio, folio))
+    if res.rows:
+        columnas = [col[0] for col in res.description]
+        return dict(zip(columnas, res.rows[0]))
+    return None
 
 # ==========================================
 # UTILIDADES
@@ -421,19 +474,25 @@ async def verificar_acceso(update, roles_permitidos=None):
     return usuario
 
 # ==========================================
-# INTERFAZ GRÁFICA (MENÚS ANIDADOS)
+# INTERFAZ GRÁFICA (MENÚS ADAPTADOS POR ÁREA)
 # ==========================================
-
 def obtener_menu_principal(usuario):
     rol = usuario["rol"]
-    teclado = [
-        [InlineKeyboardButton("🔍 CONSULTAS", callback_data="menu_consulta")],
-        [InlineKeyboardButton("✏️ EDICIÓN", callback_data="menu_edicion")]
-    ]
+    area = usuario.get("area", "enrolamiento")
+    
+    teclado = []
+    if area == "enrolamiento":
+        teclado.append([InlineKeyboardButton("🔍 CONSULTAS DPI", callback_data="menu_consulta_enrol")])
+        teclado.append([InlineKeyboardButton("✏️ EDICIÓN DPI", callback_data="menu_edicion_enrol")])
+    else:
+        teclado.append([InlineKeyboardButton("📖 CONSULTAS EVENTOS", callback_data="menu_consulta_reg")])
+        teclado.append([InlineKeyboardButton("✏️ EDICIÓN EVENTOS", callback_data="menu_edicion_reg")])
+    
     if rol in ["admin", "operador1"]:
         teclado.append([InlineKeyboardButton("👥 GESTIÓN", callback_data="menu_gestion")])
     if rol == "admin":
         teclado.append([InlineKeyboardButton("🔐 AUTORIZACIÓN", callback_data="menu_autorizacion")])
+        
     teclado.append([InlineKeyboardButton("👤 MI INFORMACIÓN", callback_data="menu_info")])
     return InlineKeyboardMarkup(teclado)
 
@@ -442,8 +501,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not usuario: return
     mensaje = (
         f"👋 *Hola, {usuario['nombre']}*\n"
-        f"Tu rol es: `{usuario['rol']}`\n\n"
-        "Selecciona una categoría para ver las opciones disponibles:"
+        f"Tu rol es: `{usuario['rol']}`\n"
+        f"Área: `{usuario.get('area', 'enrolamiento').capitalize()}`\n\n"
+        "Selecciona una categoría:"
     )
     teclado = obtener_menu_principal(usuario)
     if update.callback_query:
@@ -463,25 +523,43 @@ async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start(update, context)
     elif accion == "menu_info":
         dpi_info = f"\n👤 DPI asignado: `{usuario['dpi_asignado']}`" if usuario['dpi_asignado'] else ""
-        texto = (f"👤 *Tu información personal*\n\nNombre: {usuario['nombre']}\nRol: `{usuario['rol']}`\nID de Telegram: `{usuario['telegram_id']}`{dpi_info}")
+        texto = (f"👤 *Tu información*\n\nNombre: {usuario['nombre']}\nRol: `{usuario['rol']}`\nÁrea: `{usuario.get('area', 'enrolamiento')}`\nID: `{usuario['telegram_id']}`{dpi_info}")
         await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
-    elif accion == "menu_consulta":
-        texto = ("🔍 *MENÚ DE CONSULTAS*\n\nCopia y pega el comando que necesites en el chat:\n\n`/buscar <DPI> <N°>`\nBusca un paquete por código y número.\n\n`/fecha <DPI> <fecha>`\nBusca paquetes en una fecha específica.\n\n`/general <N°>`\nBusca por el número general único.\n\n`/usuario <DPI>`\nLista todos los paquetes de un usuario.\n\n`/total`\nMuestra cuántos paquetes hay en total.")
+        
+    # --- MENÚS DE ENROLAMIENTO ---
+    elif accion == "menu_consulta_enrol":
+        texto = ("🔍 *CONSULTAS DPI*\n\nComandos:\n`/buscar <DPI> <N°>`\n`/fecha <DPI> <fecha>`\n`/general <N°>`\n`/usuario <DPI>`\n`/total`")
         await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
-    elif accion == "menu_edicion":
-        texto = ("✏️ *MENÚ DE EDICIÓN*\n\nCopia y pega el comando que necesites en el chat:\n\n`/registrar`\nInicia el registro paso a paso.\n\n`/editar <DPI> <N°> <campo> <valor>`\nModifica un campo de un paquete.\n\n`/eliminar <DPI> <N°>`\nElimina un paquete de la base de datos.\n\n`/etiqueta <DPI> <N°>`\nGenera e imprime la etiqueta en PDF.")
+    elif accion == "menu_edicion_enrol":
+        texto = ("✏️ *EDICIÓN DPI*\n\nComandos:\n`/registrar` (paso a paso)\n`/editar <DPI> <N°> <campo> <valor>`\n`/eliminar <DPI> <N°>`\n`/etiqueta <DPI> <N°>`")
         await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
+        
+    # --- MENÚS DE EVENTOS (REGISTRO CIVIL) ---
+    elif accion == "menu_consulta_reg":
+        btn_reg = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔍 Buscar por Folio", callback_data="accion_buscar_folio")],
+            [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]
+        ])
+        await query.edit_message_text("📖 *CONSULTAS DE EVENTOS*\n\nSelecciona cómo buscar:", reply_markup=btn_reg, parse_mode="Markdown")
+    elif accion == "menu_edicion_reg":
+        btn_reg = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Registrar Evento", callback_data="accion_registrar_evento")],
+            [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]
+        ])
+        await query.edit_message_text("✏️ *EDICIÓN DE EVENTOS*\n\nSelecciona una acción:", reply_markup=btn_reg, parse_mode="Markdown")
+
+    # --- OTROS ---
     elif accion == "menu_gestion":
         if usuario["rol"] not in ["admin", "operador1"]:
             await query.answer("No tienes permiso para ver esto.", show_alert=True)
             return
-        texto = ("👥 *MENÚ DE GESTIÓN DE USUARIOS*\n\nCopia y pega el comando que necesites en el chat:\n\n`/usuarios`\nMuestra la lista de usuarios en la base de datos.\n\n`/agregar_usuario <DPI> <Nombre>`\nAgrega un nuevo usuario a la tabla.\n\n`/eliminar_usuario <DPI>`\nElimina un usuario (solo si no tiene paquetes).")
+        texto = ("👥 *GESTIÓN*\n\n`/usuarios`\n`/agregar_usuario <DPI> <Nombre>`\n`/eliminar_usuario <DPI>`")
         await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
     elif accion == "menu_autorizacion":
         if usuario["rol"] != "admin":
             await query.answer("Solo el admin puede ver esto.", show_alert=True)
             return
-        texto = ("🔐 *MENÚ DE AUTORIZACIÓN (ADMIN)*\n\nCopia y pega el comando en el chat:\n\n`/autorizar <ID> <Nombre> <Rol> [DPI]`\nDa acceso a un nuevo usuario de Telegram.\n\n`/desautorizar <ID>`\nQuita el acceso a un usuario.\n\n`/lista_autorizados`\nMuestra quiénes tienen acceso al bot.\n\n`/cambiar_rol <ID> <Rol> [DPI]`\nModifica el rol de un usuario.")
+        texto = ("🔐 *AUTORIZACIÓN*\n\n`/autorizar <ID> <Nombre> <Rol> <Área> [DPI]`\nEj: `/autorizar 123 Juan operador1 enrolamiento`\n`/lista_autorizados`")
         await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
 
 # ==========================================
@@ -493,17 +571,17 @@ async def mi_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def autorizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await verificar_acceso(update, ["admin"])
     if not usuario: return
-    if len(context.args) < 3:
-        await update.message.reply_text("⚠️ Uso: `/autorizar <ID> <nombre> <rol> [dpi]`", parse_mode="Markdown")
+    if len(context.args) < 4:
+        await update.message.reply_text("⚠️ Uso: `/autorizar <ID> <nombre> <rol> <area> [dpi]`\nÁreas: `enrolamiento` o `registro`", parse_mode="Markdown")
         return
     try: telegram_id = int(context.args[0])
     except: 
         await update.message.reply_text("⚠️ El ID debe ser número.")
         return
-    nombre, rol = context.args[1], context.args[2].lower()
-    dpi = context.args[3] if len(context.args) > 3 else None
-    exito, error = agregar_autorizado(telegram_id, nombre, rol, dpi)
-    if exito: await update.message.reply_text(f"✅ Autorizado: {nombre} como {rol}", parse_mode="Markdown")
+    nombre, rol, area = context.args[1], context.args[2].lower(), context.args[3].lower()
+    dpi = context.args[4] if len(context.args) > 4 else None
+    exito, error = agregar_autorizado(telegram_id, nombre, rol, area, dpi)
+    if exito: await update.message.reply_text(f"✅ Autorizado: {nombre} como {rol} en {area}", parse_mode="Markdown")
     else: await update.message.reply_text(f"❌ {error}")
 
 async def lista_autorizados(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -511,9 +589,9 @@ async def lista_autorizados(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not usuario: return
     lista = listar_autorizados()
     mensaje = "👥 *Usuarios autorizados:*\n\n"
-    for tg_id, nombre, rol, dpi, activo in lista:
+    for tg_id, nombre, rol, area, dpi, activo in lista:
         estado = "✅" if activo == 1 else "❌"
-        mensaje += f"{estado} *{nombre}* | `{rol}` | ID: `{tg_id}`\n"
+        mensaje += f"{estado} *{nombre}* | `{rol}` | `{area}` | ID: `{tg_id}`\n"
     await update.message.reply_text(mensaje, parse_mode="Markdown")
 
 async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -563,8 +641,171 @@ async def etiqueta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error inesperado: {str(e)}")
 
+async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update)
+    if not usuario: return
+    total = contar_paquetes()
+    await update.message.reply_text(f"📊 Total de paquetes DPI: *{total}*", parse_mode="Markdown")
+
+async def general(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update)
+    if not usuario: return
+    if len(context.args) != 1:
+        await update.message.reply_text("⚠️ Uso: `/general <número>`", parse_mode="Markdown")
+        return
+    try: num_gen = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ El número debe ser entero.")
+        return
+    resultado = buscar_por_numero_general(num_gen)
+    if not resultado:
+        await update.message.reply_text(f"❌ No se encontró el general *{num_gen}*.", parse_mode="Markdown")
+        return
+    await update.message.reply_text(formatear_mensaje(resultado), parse_mode="Markdown")
+
+async def fecha(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update)
+    if not usuario: return
+    if len(context.args) != 2:
+        await update.message.reply_text("⚠️ Uso: `/fecha <DPI> <AAAA-MM-DD>`", parse_mode="Markdown")
+        return
+    dpi = context.args[0].strip()
+    fecha_norm = normalizar_fecha(context.args[1].strip())
+    if not fecha_norm:
+        await update.message.reply_text("⚠️ Fecha inválida.", parse_mode="Markdown")
+        return
+    resultados = buscar_por_dpi_y_fecha(dpi, fecha_norm)
+    if not resultados:
+        await update.message.reply_text(f"❌ No hay paquetes del DPI `{dpi}` en esa fecha.", parse_mode="Markdown")
+        return
+    mensaje = f"📅 *Paquetes del DPI* `{dpi}` que incluyen *{fecha_norm}*\n\n"
+    for r in resultados:
+        gen = r.get('numero_general')
+        gen_txt = f"`{gen}`" if gen is not None else "_blanco_"
+        mensaje += f"📦 N° *{r.get('num_paquete')}* (Gen: {gen_txt})\n   📍 `{r.get('ubicacion_armada')}`\n\n"
+        if len(mensaje) > 3800:
+            await update.message.reply_text(mensaje, parse_mode="Markdown")
+            mensaje = ""
+    if mensaje:
+        await update.message.reply_text(mensaje, parse_mode="Markdown")
+
+async def usuario_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update)
+    if not usuario: return
+    if len(context.args) != 1:
+        await update.message.reply_text("⚠️ Uso: `/usuario <DPI>`", parse_mode="Markdown")
+        return
+    dpi = context.args[0].strip()
+    if usuario["rol"] == "operador2" and dpi != usuario["dpi_asignado"]:
+        await update.message.reply_text(f"🚫 Solo puedes consultar tu propio DPI: `{usuario['dpi_asignado']}`", parse_mode="Markdown")
+        return
+    resultados = buscar_por_usuario(dpi)
+    if not resultados:
+        await update.message.reply_text(f"❌ No hay paquetes para el DPI `{dpi}`.", parse_mode="Markdown")
+        return
+    mensaje = f"👤 *Paquetes del usuario* `{dpi}`\n📦 Total: *{len(resultados)}*\n\n"
+    for r in resultados:
+        gen = r.get('numero_general')
+        gen_txt = f"`{gen}`" if gen is not None else "_blanco_"
+        mensaje += f"📦 N° *{r.get('num_paquete')}* (Gen: {gen_txt}) → `{r.get('ubicacion_armada')}`\n   📅 {r.get('fecha_del')} al {r.get('fecha_al')}\n\n"
+        if len(mensaje) > 3800:
+            await update.message.reply_text(mensaje, parse_mode="Markdown")
+            mensaje = ""
+    if mensaje:
+        await update.message.reply_text(mensaje, parse_mode="Markdown")
+
+async def eliminar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
+    if not usuario: return
+    if len(context.args) != 2:
+        await update.message.reply_text("⚠️ Uso: `/eliminar <DPI> <N°>`", parse_mode="Markdown")
+        return
+    dpi = context.args[0]
+    if usuario["rol"] == "operador2" and dpi != usuario["dpi_asignado"]:
+        await update.message.reply_text("🚫 Solo puedes eliminar paquetes de tu propio DPI.")
+        return
+    try: num = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("⚠️ El número debe ser entero.")
+        return
+    resultado = buscar_por_dpi_y_numero(dpi, num)
+    if not resultado:
+        await update.message.reply_text(f"❌ No se encontró el paquete {num} del DPI `{dpi}`.")
+        return
+    if eliminar_paquete(dpi, num):
+        await update.message.reply_text(f"✅ Paquete N° {num} del DPI `{dpi}` eliminado.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ No se pudo eliminar.")
+
+async def editar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
+    if not usuario: return
+    if len(context.args) != 4:
+        await update.message.reply_text("⚠️ Uso: `/editar <DPI> <N°> <campo> <valor>`\nCampos: `fecha_del`, `fecha_al`, `estanteria`, `fila`, `columna`, `pila`, `numero_general`", parse_mode="Markdown")
+        return
+    dpi = context.args[0]
+    if usuario["rol"] == "operador2" and dpi != usuario["dpi_asignado"]:
+        await update.message.reply_text("🚫 Solo puedes editar paquetes de tu propio DPI.")
+        return
+    try: num = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("⚠️ El número debe ser entero.")
+        return
+    campo = context.args[2]
+    valor = context.args[3]
+    if actualizar_paquete(dpi, num, campo, valor):
+        await update.message.reply_text(f"✅ Campo `{campo}` actualizado a `{valor}`.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ No se pudo actualizar.")
+
+async def agregar_usuario_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin", "operador1"])
+    if not usuario: return
+    if len(context.args) < 2:
+        await update.message.reply_text("⚠️ Uso: `/agregar_usuario <DPI> <Nombre>`", parse_mode="Markdown")
+        return
+    dpi = context.args[0]
+    nombre = " ".join(context.args[1:])
+    if agregar_usuario(dpi, nombre):
+        await update.message.reply_text(f"✅ Usuario agregado: `{dpi}` - {nombre}", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ El DPI `{dpi}` ya existe.", parse_mode="Markdown")
+
+async def usuarios(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin", "operador1"])
+    if not usuario: return
+    lista = listar_usuarios()
+    if not lista:
+        await update.message.reply_text("No hay usuarios.")
+        return
+    mensaje = "👥 *Usuarios (tabla usuarios):*\n\n"
+    for dpi, nombre in lista:
+        total_paq = contar_paquetes_de_usuario(dpi)
+        mensaje += f"• `{dpi}` - {nombre} ({total_paq} paq.)\n"
+        if len(mensaje) > 3800:
+            await update.message.reply_text(mensaje, parse_mode="Markdown")
+            mensaje = ""
+    if mensaje:
+        await update.message.reply_text(mensaje, parse_mode="Markdown")
+
+async def eliminar_usuario_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin", "operador1"])
+    if not usuario: return
+    if len(context.args) != 1:
+        await update.message.reply_text("⚠️ Uso: `/eliminar_usuario <DPI>`", parse_mode="Markdown")
+        return
+    dpi = context.args[0]
+    total_paq = contar_paquetes_de_usuario(dpi)
+    if total_paq > 0:
+        await update.message.reply_text(f"⚠️ El usuario tiene {total_paq} paquetes. Elimínalos primero.", parse_mode="Markdown")
+        return
+    if eliminar_usuario(dpi):
+        await update.message.reply_text(f"✅ Usuario `{dpi}` eliminado.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ No se encontró.")
+
 # ==========================================
-# REGISTRO PASO A PASO (CONVERSATION HANDLER)
+# FLUJOS DE REGISTRO (ENROLAMIENTO)
 # ==========================================
 async def registrar_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
@@ -655,11 +896,6 @@ async def reg_general(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
-async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("❌ Cancelado.")
-    return ConversationHandler.END
-
 async def registrar_directo(update: Update, context: ContextTypes.DEFAULT_TYPE, usuario):
     if len(context.args) not in (8, 9): return ConversationHandler.END
     dpi = context.args[0]
@@ -676,181 +912,136 @@ async def registrar_directo(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     return ConversationHandler.END
 
 # ==========================================
-# COMANDOS DE CONSULTA FALTANTES
+# FLUJOS DE EVENTOS (REGISTRO CIVIL)
 # ==========================================
-async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    usuario = await verificar_acceso(update)
-    if not usuario: return
-    total = contar_paquetes()
-    await update.message.reply_text(f"📊 Total de paquetes: *{total}*", parse_mode="Markdown")
+async def inicio_registrar_evento(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    teclado = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👶 Nacimiento", callback_data="tipo_Nacimiento")],
+        [InlineKeyboardButton("💍 Matrimonio", callback_data="tipo_Matrimonio")],
+        [InlineKeyboardButton("⚰️ Defunción", callback_data="tipo_Defuncion")],
+        [InlineKeyboardButton("🔙 Cancelar", callback_data="menu_inicio")]
+    ])
+    await query.edit_message_text("📝 *Registrar Evento*\n\nSelecciona el tipo:", reply_markup=teclado, parse_mode="Markdown")
+    return EV_TIPO
 
-async def general(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    usuario = await verificar_acceso(update)
-    if not usuario: return
-    if len(context.args) != 1:
-        await update.message.reply_text("⚠️ Uso: `/general <número>`", parse_mode="Markdown")
-        return
-    try: num_gen = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("⚠️ El número debe ser entero.")
-        return
-    resultado = buscar_por_numero_general(num_gen)
-    if not resultado:
-        await update.message.reply_text(f"❌ No se encontró el general *{num_gen}*.", parse_mode="Markdown")
-        return
-    await update.message.reply_text(formatear_mensaje(resultado), parse_mode="Markdown")
+async def flujo_evento_tipo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tipo = query.data.replace("tipo_", "")
+    context.user_data["ev_tipo"] = tipo
+    await query.edit_message_text(f"Tipo: *{tipo}*\n\nIngresa el *Año* (ej: 2023):", parse_mode="Markdown")
+    return EV_ANIO
 
-async def fecha(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def flujo_evento_anio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: anio = int(update.message.text.strip())
+    except:
+        await update.message.reply_text("⚠️ Debe ser un año válido:")
+        return EV_ANIO
+    context.user_data["ev_anio"] = anio
+    await update.message.reply_text("Ingresa el *Número de Paquete*:")
+    return EV_NUM
+
+async def flujo_evento_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: num = int(update.message.text.strip())
+    except:
+        await update.message.reply_text("⚠️ Debe ser un número entero:")
+        return EV_NUM
+    context.user_data["ev_num"] = num
+    await update.message.reply_text("Ingresa el *Folio de Inicio* (ej: 59495):")
+    return EV_FOLIO_INI
+
+async def flujo_evento_folio_ini(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: folio = int(update.message.text.strip())
+    except:
+        await update.message.reply_text("⚠️ Debe ser un número entero:")
+        return EV_FOLIO_INI
+    context.user_data["ev_folio_ini"] = folio
+    await update.message.reply_text("Ingresa el *Folio Final* (ej: 59497):")
+    return EV_FOLIO_FIN
+
+async def flujo_evento_folio_fin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: folio = int(update.message.text.strip())
+    except:
+        await update.message.reply_text("⚠️ Debe ser un número entero:")
+        return EV_FOLIO_FIN
+    context.user_data["ev_folio_fin"] = folio
+    await update.message.reply_text("Ingresa la *Estantería*:")
+    return EV_EST
+
+async def flujo_evento_est(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["ev_est"] = update.message.text.strip()
+    await update.message.reply_text("Ingresa la *Fila*:")
+    return EV_FIL
+
+async def flujo_evento_fil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["ev_fil"] = update.message.text.strip()
+    await update.message.reply_text("Ingresa la *Columna* (A, B, C, D):")
+    return EV_COL
+
+async def flujo_evento_col(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    col = update.message.text.strip().upper()
+    if col not in ["A", "B", "C", "D"]:
+        await update.message.reply_text("⚠️ Debe ser A, B, C o D:")
+        return EV_COL
+    context.user_data["ev_col"] = col
+    await update.message.reply_text("Ingresa la *Pila/Nivel*:")
+    return EV_PIL
+
+async def flujo_evento_pil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pil = update.message.text.strip()
+    datos = context.user_data
     usuario = await verificar_acceso(update)
-    if not usuario: return
-    if len(context.args) != 2:
-        await update.message.reply_text("⚠️ Uso: `/fecha <DPI> <AAAA-MM-DD>`", parse_mode="Markdown")
-        return
-    dpi = context.args[0].strip()
-    fecha_norm = normalizar_fecha(context.args[1].strip())
-    if not fecha_norm:
-        await update.message.reply_text("⚠️ Fecha inválida.", parse_mode="Markdown")
-        return
-    resultados = buscar_por_dpi_y_fecha(dpi, fecha_norm)
-    if not resultados:
-        await update.message.reply_text(f"❌ No hay paquetes del DPI `{dpi}` en esa fecha.", parse_mode="Markdown")
-        return
-    mensaje = f"📅 *Paquetes del DPI* `{dpi}` que incluyen *{fecha_norm}*\n\n"
-    for r in resultados:
-        gen = r.get('numero_general')
-        gen_txt = f"`{gen}`" if gen is not None else "_blanco_"
-        mensaje += f"📦 N° *{r.get('num_paquete')}* (Gen: {gen_txt})\n   📍 `{r.get('ubicacion_armada')}`\n\n"
-        if len(mensaje) > 3800:
-            await update.message.reply_text(mensaje, parse_mode="Markdown")
-            mensaje = ""
-    if mensaje:
+    
+    exito, error = insertar_evento(
+        datos["ev_tipo"], datos["ev_anio"], datos["ev_num"], 
+        datos["ev_folio_ini"], datos["ev_folio_fin"], 
+        datos["ev_est"], datos["ev_fil"], datos["ev_col"], pil,
+        usuario["dpi_asignado"] or usuario["nombre"]
+    )
+    
+    if exito:
+        await update.message.reply_text(f"✅ *Evento Registrado*\n\nTipo: {datos['ev_tipo']}\nAño: {datos['ev_anio']}\nPaquete: {datos['ev_num']}\nFolios: {datos['ev_folio_ini']} al {datos['ev_folio_fin']}\nUbicación: E{datos['ev_est']}-F{datos['ev_fil']}-{datos['ev_col']}-P{pil}", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ Error: {error}")
+    
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def inicio_buscar_folio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🔍 *Buscar por Folio*\n\nEscribe el número de folio (ej: 59496):", parse_mode="Markdown")
+    return EV_BUS_FOLIO
+
+async def flujo_buscar_folio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: folio = int(update.message.text.strip())
+    except:
+        await update.message.reply_text("⚠️ Debe ser un número entero:")
+        return EV_BUS_FOLIO
+    
+    res = buscar_evento_por_folio(folio)
+    if res:
+        mensaje = (f"📖 *Evento Encontrado*\n\n"
+                   f"Tipo: {res['tipo_evento']}\n"
+                   f"Año: {res['anio']}\n"
+                   f"Paquete N°: {res['num_paquete']}\n"
+                   f"Rango: {res['folio_inicio']} al {res['folio_fin']}\n"
+                   f"Ubicación: E{res['estanteria']}-F{res['fila']}-{res['columna']}-P{res['pila']}")
         await update.message.reply_text(mensaje, parse_mode="Markdown")
-
-async def usuario_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    usuario = await verificar_acceso(update)
-    if not usuario: return
-    if len(context.args) != 1:
-        await update.message.reply_text("⚠️ Uso: `/usuario <DPI>`", parse_mode="Markdown")
-        return
-    dpi = context.args[0].strip()
-    if usuario["rol"] == "operador2" and dpi != usuario["dpi_asignado"]:
-        await update.message.reply_text(f"🚫 Solo puedes consultar tu propio DPI: `{usuario['dpi_asignado']}`", parse_mode="Markdown")
-        return
-    resultados = buscar_por_usuario(dpi)
-    if not resultados:
-        await update.message.reply_text(f"❌ No hay paquetes para el DPI `{dpi}`.", parse_mode="Markdown")
-        return
-    mensaje = f"👤 *Paquetes del usuario* `{dpi}`\n📦 Total: *{len(resultados)}*\n\n"
-    for r in resultados:
-        gen = r.get('numero_general')
-        gen_txt = f"`{gen}`" if gen is not None else "_blanco_"
-        mensaje += f"📦 N° *{r.get('num_paquete')}* (Gen: {gen_txt}) → `{r.get('ubicacion_armada')}`\n   📅 {r.get('fecha_del')} al {r.get('fecha_al')}\n\n"
-        if len(mensaje) > 3800:
-            await update.message.reply_text(mensaje, parse_mode="Markdown")
-            mensaje = ""
-    if mensaje:
-        await update.message.reply_text(mensaje, parse_mode="Markdown")
-
-# ==========================================
-# COMANDOS DE EDICIÓN FALTANTES
-# ==========================================
-async def eliminar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
-    if not usuario: return
-    if len(context.args) != 2:
-        await update.message.reply_text("⚠️ Uso: `/eliminar <DPI> <N°>`", parse_mode="Markdown")
-        return
-    dpi = context.args[0]
-    if usuario["rol"] == "operador2" and dpi != usuario["dpi_asignado"]:
-        await update.message.reply_text("🚫 Solo puedes eliminar paquetes de tu propio DPI.")
-        return
-    try: num = int(context.args[1])
-    except ValueError:
-        await update.message.reply_text("⚠️ El número debe ser entero.")
-        return
-    resultado = buscar_por_dpi_y_numero(dpi, num)
-    if not resultado:
-        await update.message.reply_text(f"❌ No se encontró el paquete {num} del DPI `{dpi}`.")
-        return
-    if eliminar_paquete(dpi, num):
-        await update.message.reply_text(f"✅ Paquete N° {num} del DPI `{dpi}` eliminado.", parse_mode="Markdown")
     else:
-        await update.message.reply_text("❌ No se pudo eliminar.")
+        await update.message.reply_text(f"❌ No se encontró ningún paquete con el folio {folio}.")
+    return ConversationHandler.END
 
-async def editar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
-    if not usuario: return
-    if len(context.args) != 4:
-        await update.message.reply_text("⚠️ Uso: `/editar <DPI> <N°> <campo> <valor>`\nCampos: `fecha_del`, `fecha_al`, `estanteria`, `fila`, `columna`, `pila`, `numero_general`", parse_mode="Markdown")
-        return
-    dpi = context.args[0]
-    if usuario["rol"] == "operador2" and dpi != usuario["dpi_asignado"]:
-        await update.message.reply_text("🚫 Solo puedes editar paquetes de tu propio DPI.")
-        return
-    try: num = int(context.args[1])
-    except ValueError:
-        await update.message.reply_text("⚠️ El número debe ser entero.")
-        return
-    campo = context.args[2]
-    valor = context.args[3]
-    if actualizar_paquete(dpi, num, campo, valor):
-        await update.message.reply_text(f"✅ Campo `{campo}` actualizado a `{valor}`.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"❌ No se pudo actualizar.")
+async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("❌ Cancelado.")
+    return ConversationHandler.END
 
-# ==========================================
-# COMANDOS DE USUARIOS (TABLA USUARIOS) FALTANTES
-# ==========================================
-async def agregar_usuario_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    usuario = await verificar_acceso(update, ["admin", "operador1"])
-    if not usuario: return
-    if len(context.args) < 2:
-        await update.message.reply_text("⚠️ Uso: `/agregar_usuario <DPI> <Nombre>`", parse_mode="Markdown")
-        return
-    dpi = context.args[0]
-    nombre = " ".join(context.args[1:])
-    if agregar_usuario(dpi, nombre):
-        await update.message.reply_text(f"✅ Usuario agregado: `{dpi}` - {nombre}", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"❌ El DPI `{dpi}` ya existe.", parse_mode="Markdown")
-
-async def usuarios(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    usuario = await verificar_acceso(update, ["admin", "operador1"])
-    if not usuario: return
-    lista = listar_usuarios()
-    if not lista:
-        await update.message.reply_text("No hay usuarios.")
-        return
-    mensaje = "👥 *Usuarios (tabla usuarios):*\n\n"
-    for dpi, nombre in lista:
-        total_paq = contar_paquetes_de_usuario(dpi)
-        mensaje += f"• `{dpi}` - {nombre} ({total_paq} paq.)\n"
-        if len(mensaje) > 3800:
-            await update.message.reply_text(mensaje, parse_mode="Markdown")
-            mensaje = ""
-    if mensaje:
-        await update.message.reply_text(mensaje, parse_mode="Markdown")
-
-async def eliminar_usuario_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    usuario = await verificar_acceso(update, ["admin", "operador1"])
-    if not usuario: return
-    if len(context.args) != 1:
-        await update.message.reply_text("⚠️ Uso: `/eliminar_usuario <DPI>`", parse_mode="Markdown")
-        return
-    dpi = context.args[0]
-    total_paq = contar_paquetes_de_usuario(dpi)
-    if total_paq > 0:
-        await update.message.reply_text(f"⚠️ El usuario tiene {total_paq} paquetes. Elimínalos primero.", parse_mode="Markdown")
-        return
-    if eliminar_usuario(dpi):
-        await update.message.reply_text(f"✅ Usuario `{dpi}` eliminado.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"❌ No se encontró.")
-        
 # ==========================================
 # MAIN Y SERVIDOR WEB PARA RENDER
 # ==========================================
-
 app_web = Flask(__name__)
 
 @app_web.route('/')
@@ -869,6 +1060,7 @@ if __name__ == "__main__":
 
     print("🤖 Iniciando bot...")
     inicializar_tabla_telegram()
+    inicializar_tabla_eventos()
     
     app = Application.builder().token(TOKEN).build()
     
@@ -892,7 +1084,8 @@ if __name__ == "__main__":
     
     app.add_handler(CallbackQueryHandler(botones_menu))
     
-    conv_handler = ConversationHandler(
+    # Flujo de Registro Enrolamiento
+    conv_registro = ConversationHandler(
         entry_points=[CommandHandler("registrar", registrar_inicio)],
         states={
             REG_DPI: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_dpi)],
@@ -908,7 +1101,37 @@ if __name__ == "__main__":
         fallbacks=[CommandHandler("cancelar", cancelar)],
         per_message=False,
     )
-    app.add_handler(conv_handler)
+    app.add_handler(conv_registro)
+
+    # Flujo de Registro Eventos
+    conv_evento = ConversationHandler(
+        entry_points=[CallbackQueryHandler(inicio_registrar_evento, pattern="^accion_registrar_evento$")],
+        states={
+            EV_TIPO: [CallbackQueryHandler(flujo_evento_tipo, pattern="^tipo_")],
+            EV_ANIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_anio)],
+            EV_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_num)],
+            EV_FOLIO_INI: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_folio_ini)],
+            EV_FOLIO_FIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_folio_fin)],
+            EV_EST: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_est)],
+            EV_FIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_fil)],
+            EV_COL: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_col)],
+            EV_PIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_pil)],
+        },
+        fallbacks=[CommandHandler("cancelar", cancelar)],
+        per_message=False,
+    )
+    app.add_handler(conv_evento)
+
+    # Flujo de Búsqueda por Folio
+    conv_bus_folio = ConversationHandler(
+        entry_points=[CallbackQueryHandler(inicio_buscar_folio, pattern="^accion_buscar_folio$")],
+        states={
+            EV_BUS_FOLIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_buscar_folio)],
+        },
+        fallbacks=[CommandHandler("cancelar", cancelar)],
+        per_message=False,
+    )
+    app.add_handler(conv_bus_folio)
     
     print("✅ Bot activo. Presiona /start en Telegram.")
     app.run_polling()
