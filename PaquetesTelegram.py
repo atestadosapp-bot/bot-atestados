@@ -477,7 +477,6 @@ async def verificar_acceso(update, roles_permitidos=None):
 # INTERFAZ GRÁFICA (MENÚS ADAPTADOS POR ÁREA)
 # ==========================================
 def obtener_menu_principal(usuario):
-def obtener_menu_principal(usuario):
     rol = usuario["rol"]
     area = usuario.get("area", "enrolamiento")
     
