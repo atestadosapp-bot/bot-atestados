@@ -38,7 +38,6 @@ def conectar_db():
 # ==========================================
 def inicializar_tabla_telegram():
     client = conectar_db()
-    # Agregamos la columna 'area' (por defecto enrolamiento)
     client.execute("""
         CREATE TABLE IF NOT EXISTS usuarios_telegram (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,11 +51,10 @@ def inicializar_tabla_telegram():
         )
     """)
     
-    # Intentar agregar la columna si la tabla ya existía de antes (por si acaso)
     try:
         client.execute("ALTER TABLE usuarios_telegram ADD COLUMN area TEXT DEFAULT 'enrolamiento'")
     except:
-        pass # Si ya existe, no hace nada
+        pass
 
     res = client.execute("SELECT COUNT(*) FROM usuarios_telegram WHERE telegram_id = ?", (ADMIN_INICIAL_ID,))
     if res.rows[0][0] == 0:
@@ -1092,8 +1090,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("autorizar", autorizar))
     app.add_handler(CommandHandler("lista_autorizados", lista_autorizados))
     
-   # app.add_handler(CallbackQueryHandler(botones_menu))
-    
     # Flujo de Registro Enrolamiento
     conv_registro = ConversationHandler(
         entry_points=[CommandHandler("registrar", registrar_inicio)],
@@ -1142,6 +1138,9 @@ if __name__ == "__main__":
         per_message=False,
     )
     app.add_handler(conv_bus_folio)
+    
+    # MANEJADOR DE BOTONES DEL MENÚ (Con filtro para que no interfiera con los eventos)
+    app.add_handler(CallbackQueryHandler(botones_menu, pattern="^(menu_|accion_buscar_folio$)"))
     
     print("✅ Bot activo. Presiona /start en Telegram.")
     app.run_polling()
