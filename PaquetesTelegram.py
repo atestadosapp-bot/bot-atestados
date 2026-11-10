@@ -1092,7 +1092,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("autorizar", autorizar))
     app.add_handler(CommandHandler("lista_autorizados", lista_autorizados))
     
-    app.add_handler(CallbackQueryHandler(botones_menu))
+   # app.add_handler(CallbackQueryHandler(botones_menu))
     
     # Flujo de Registro Enrolamiento
     conv_registro = ConversationHandler(
