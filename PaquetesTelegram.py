@@ -23,8 +23,8 @@ ADMIN_INICIAL_ID = 6491907692
 (REG_DPI, REG_DEL, REG_AL, REG_NUM, REG_EST, REG_FIL, REG_COL, REG_PIL, REG_GENERAL) = range(9)
 
 # Estados para el flujo de EVENTOS (REGISTRO CIVIL)
-(EV_TIPO, EV_ANIO, EV_NUM, EV_FOLIO_INI, EV_FOLIO_FIN, EV_EST, EV_FIL, EV_COL, EV_PIL) = range(20, 29)
-(EV_BUS_FOLIO,) = range(30, 31)
+(EV_TIPO, EV_ANIO, EV_NUM, EV_FOLIO_INI, EV_FOLIO_FIN, EV_GENERAL, EV_EST, EV_FIL, EV_COL, EV_PIL) = range(20, 30)
+(EV_BUS_FOLIO, EV_BUS_GENERAL) = range(30, 32)
 
 # ==========================================
 # CONEXIÓN A LA BASE DE DATOS (TURSO)
@@ -74,6 +74,7 @@ def inicializar_tabla_eventos():
             num_paquete INTEGER NOT NULL,
             folio_inicio INTEGER NOT NULL,
             folio_fin INTEGER NOT NULL,
+            numero_general INTEGER,
             estanteria TEXT,
             fila TEXT,
             columna TEXT,
@@ -83,6 +84,11 @@ def inicializar_tabla_eventos():
             UNIQUE(tipo_evento, anio, num_paquete)
         )
     """)
+    # Intentar agregar la columna por si la tabla ya existía sin ella
+    try:
+        client.execute("ALTER TABLE eventos ADD COLUMN numero_general INTEGER")
+    except:
+        pass
 
 # ==========================================
 # FUNCIONES DE USUARIOS TELEGRAM
@@ -264,13 +270,18 @@ def contar_paquetes_de_usuario(dpi):
 # ==========================================
 # FUNCIONES DE BASE DE DATOS (EVENTOS - REGISTRO CIVIL)
 # ==========================================
-def insertar_evento(tipo, anio, num_paq, folio_ini, folio_fin, est, fil, col, pil, operador):
+def insertar_evento(tipo, anio, num_paq, folio_ini, folio_fin, num_general, est, fil, col, pil, operador):
     client = conectar_db()
     try:
+        if str(num_general).lower() in ("blanco", "null", ""):
+            num_general_val = None
+        else:
+            num_general_val = int(num_general)
+
         client.execute("""
-            INSERT INTO eventos (tipo_evento, anio, num_paquete, folio_inicio, folio_fin, estanteria, fila, columna, pila, registrado_por, fecha_registro)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (tipo, anio, num_paq, folio_ini, folio_fin, est, fil, col, pil, operador, datetime.now().strftime("%Y-%m-%d %H:%M")))
+            INSERT INTO eventos (tipo_evento, anio, num_paquete, folio_inicio, folio_fin, numero_general, estanteria, fila, columna, pila, registrado_por, fecha_registro)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (tipo, anio, num_paq, folio_ini, folio_fin, num_general_val, est, fil, col, pil, operador, datetime.now().strftime("%Y-%m-%d %H:%M")))
         return True, None
     except Exception as e:
         return False, str(e)
@@ -281,6 +292,14 @@ def buscar_evento_por_folio(folio):
         SELECT * FROM eventos 
         WHERE folio_inicio <= ? AND folio_fin >= ?
     """, (folio, folio))
+    if res.rows:
+        columnas = [col[0] for col in res.description]
+        return dict(zip(columnas, res.rows[0]))
+    return None
+
+def buscar_evento_por_general(num_general):
+    client = conectar_db()
+    res = client.execute("SELECT * FROM eventos WHERE numero_general = ?", (num_general,))
     if res.rows:
         columnas = [col[0] for col in res.description]
         return dict(zip(columnas, res.rows[0]))
@@ -480,14 +499,11 @@ def obtener_menu_principal(usuario):
     
     teclado = []
     
-    # Si es admin, ve AMBOS menús (Enrolamiento y Registro)
     if rol == "admin":
         teclado.append([InlineKeyboardButton("🔍 CONSULTAS DPI (Enrolamiento)", callback_data="menu_consulta_enrol")])
         teclado.append([InlineKeyboardButton("✏️ EDICIÓN DPI (Enrolamiento)", callback_data="menu_edicion_enrol")])
         teclado.append([InlineKeyboardButton("📖 CONSULTAS EVENTOS (Registro)", callback_data="menu_consulta_reg")])
         teclado.append([InlineKeyboardButton("✏️ EDICIÓN EVENTOS (Registro)", callback_data="menu_edicion_reg")])
-    
-    # Si es operador u otro, solo ve el menú de su área asignada
     else:
         if area == "enrolamiento":
             teclado.append([InlineKeyboardButton("🔍 CONSULTAS DPI", callback_data="menu_consulta_enrol")])
@@ -546,6 +562,7 @@ async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif accion == "menu_consulta_reg":
         btn_reg = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔍 Buscar por Folio", callback_data="accion_buscar_folio")],
+            [InlineKeyboardButton("🔢 Buscar por N° General", callback_data="accion_buscar_general")],
             [InlineKeyboardButton("📊 Totales por Año", callback_data="accion_totales_anio")],
             [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]
         ])
@@ -979,6 +996,12 @@ async def flujo_evento_folio_fin(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("⚠️ Debe ser un número entero:")
         return EV_FOLIO_FIN
     context.user_data["ev_folio_fin"] = folio
+    await update.message.reply_text("Ingresa el *Número General* (número o escribe 'blanco'):")
+    return EV_GENERAL
+
+async def flujo_evento_general(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    general = update.message.text.strip()
+    context.user_data["ev_general"] = general
     await update.message.reply_text("Ingresa la *Estantería*:")
     return EV_EST
 
@@ -1008,13 +1031,14 @@ async def flujo_evento_pil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     exito, error = insertar_evento(
         datos["ev_tipo"], datos["ev_anio"], datos["ev_num"], 
-        datos["ev_folio_ini"], datos["ev_folio_fin"], 
+        datos["ev_folio_ini"], datos["ev_folio_fin"], datos["ev_general"],
         datos["ev_est"], datos["ev_fil"], datos["ev_col"], pil,
         usuario["dpi_asignado"] or usuario["nombre"]
     )
     
     if exito:
-        await update.message.reply_text(f"✅ *Evento Registrado*\n\nTipo: {datos['ev_tipo']}\nAño: {datos['ev_anio']}\nPaquete: {datos['ev_num']}\nFolios: {datos['ev_folio_ini']} al {datos['ev_folio_fin']}\nUbicación: E{datos['ev_est']}-F{datos['ev_fil']}-{datos['ev_col']}-P{pil}", parse_mode="Markdown")
+        gen_txt = f"`{datos['ev_general']}`" if datos['ev_general'].lower() not in ('blanco', 'null', '') else "_blanco_"
+        await update.message.reply_text(f"✅ *Evento Registrado*\n\nTipo: {datos['ev_tipo']}\nAño: {datos['ev_anio']}\nPaquete: {datos['ev_num']}\nGen: {gen_txt}\nFolios: {datos['ev_folio_ini']} al {datos['ev_folio_fin']}\nUbicación: E{datos['ev_est']}-F{datos['ev_fil']}-{datos['ev_col']}-P{pil}", parse_mode="Markdown")
     else:
         await update.message.reply_text(f"❌ Error: {error}")
     
@@ -1041,11 +1065,41 @@ async def flujo_buscar_folio(update: Update, context: ContextTypes.DEFAULT_TYPE)
                    f"Tipo: {res['tipo_evento']}\n"
                    f"Año: {res['anio']}\n"
                    f"Paquete N°: {res['num_paquete']}\n"
+                   f"Gen: {res.get('numero_general', 'En blanco')}\n"
                    f"Rango: {res['folio_inicio']} al {res['folio_fin']}\n"
                    f"Ubicación: E{res['estanteria']}-F{res['fila']}-{res['columna']}-P{res['pila']}")
         await update.message.reply_text(mensaje, reply_markup=btn_volver, parse_mode="Markdown")
     else:
         await update.message.reply_text(f"❌ No se encontró ningún paquete con el folio {folio}.", reply_markup=btn_volver)
+    
+    return ConversationHandler.END
+
+async def inicio_buscar_general(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🔢 *Buscar por N° General*\n\nEscribe el número general del paquete:", parse_mode="Markdown")
+    return EV_BUS_GENERAL
+
+async def flujo_buscar_general(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: num_gen = int(update.message.text.strip())
+    except:
+        await update.message.reply_text("⚠️ Debe ser un número entero:")
+        return EV_BUS_GENERAL
+    
+    res = buscar_evento_por_general(num_gen)
+    btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+    
+    if res:
+        mensaje = (f"📖 *Evento Encontrado*\n\n"
+                   f"Tipo: {res['tipo_evento']}\n"
+                   f"Año: {res['anio']}\n"
+                   f"Paquete N°: {res['num_paquete']}\n"
+                   f"Gen: {res.get('numero_general', 'En blanco')}\n"
+                   f"Rango: {res['folio_inicio']} al {res['folio_fin']}\n"
+                   f"Ubicación: E{res['estanteria']}-F{res['fila']}-{res['columna']}-P{res['pila']}")
+        await update.message.reply_text(mensaje, reply_markup=btn_volver, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ No se encontró ningún paquete con el N° General {num_gen}.", reply_markup=btn_volver)
     
     return ConversationHandler.END
 
@@ -1125,6 +1179,7 @@ if __name__ == "__main__":
             EV_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_num)],
             EV_FOLIO_INI: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_folio_ini)],
             EV_FOLIO_FIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_folio_fin)],
+            EV_GENERAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_general)],
             EV_EST: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_est)],
             EV_FIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_fil)],
             EV_COL: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_col)],
@@ -1145,8 +1200,19 @@ if __name__ == "__main__":
         per_message=False,
     )
     app.add_handler(conv_bus_folio)
+
+    # 4. Flujo de Búsqueda por Número General
+    conv_bus_general = ConversationHandler(
+        entry_points=[CallbackQueryHandler(inicio_buscar_general, pattern="^accion_buscar_general$")],
+        states={
+            EV_BUS_GENERAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_buscar_general)],
+        },
+        fallbacks=[CommandHandler("cancelar", cancelar)],
+        per_message=False,
+    )
+    app.add_handler(conv_bus_general)
     
-    # 4. MANEJADOR DE BOTONES DEL MENÚ (Filtrado para que no interfiera con los flujos)
+    # 5. MANEJADOR DE BOTONES DEL MENÚ
     app.add_handler(CallbackQueryHandler(botones_menu, pattern="^menu_"))
     
     print("✅ Bot activo. Presiona /start en Telegram.")
