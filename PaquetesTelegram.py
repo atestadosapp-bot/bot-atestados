@@ -1,10 +1,12 @@
 import os
 import tempfile
 import threading
+import traceback
 import libsql_client
 from flask import Flask
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Conflict
 from telegram.ext import (
     Application, CommandHandler, ContextTypes,
     ConversationHandler, MessageHandler, filters, CallbackQueryHandler
@@ -26,13 +28,54 @@ ADMIN_INICIAL_ID = 6491907692
 (EV_TIPO, EV_ANIO, EV_NUM, EV_FOLIO_INI, EV_FOLIO_FIN, EV_GENERAL, EV_EST, EV_FIL, EV_COL, EV_PIL) = range(20, 30)
 (EV_BUS_FOLIO, EV_BUS_GENERAL) = range(30, 32)
 (EV_EDIT_GENERAL, EV_EDIT_CAMPO, EV_EDIT_VALOR) = range(32, 35) # Nuevos estados para edición
+ENROL_ARGS = 40  # Estado para las consultas/ediciones de Enrolamiento con botones
 
 # ==========================================
 # CONEXIÓN A LA BASE DE DATOS (TURSO)
 # ==========================================
+class _ClienteDB:
+    """Una sola conexión a Turso, reutilizada por todo el bot (evita abrir una por consulta)."""
+    def __init__(self):
+        self._c = None
+        self._lock = threading.RLock()
+
+    def _cerrar(self):
+        try:
+            if self._c is not None:
+                self._c.close()
+        except Exception:
+            pass
+        self._c = None
+
+    def execute(self, sql, args=None):
+        with self._lock:
+            for intento in (1, 2):
+                try:
+                    if self._c is None:
+                        url_https = TURSO_URL.replace("libsql://", "https://")
+                        self._c = libsql_client.create_client_sync(url_https, auth_token=TURSO_TOKEN)
+                    if args is None:
+                        return self._c.execute(sql)
+                    return self._c.execute(sql, args)
+                except Exception:
+                    # Reabre la conexión y reintenta una vez; si vuelve a fallar, propaga el error
+                    self._cerrar()
+                    if intento == 2:
+                        raise
+
+_DB = _ClienteDB()
+
 def conectar_db():
-    url_https = TURSO_URL.replace("libsql://", "https://")
-    return libsql_client.create_client_sync(url_https, auth_token=TURSO_TOKEN)
+    return _DB
+
+def _nombres_columnas(res):
+    cols = getattr(res, "columns", None)
+    if cols:
+        return list(cols)
+    desc = getattr(res, "description", None)
+    if desc:
+        return [c[0] for c in desc]
+    return []
 
 # ==========================================
 # INICIALIZACIÓN DE TABLAS
@@ -249,22 +292,21 @@ def insertar_evento(tipo, anio, num_paq, folio_ini, folio_fin, num_general, est,
         return False, str(e)
 
 def buscar_evento_por_folio(folio):
+    """Devuelve una LISTA de paquetes: el mismo número puede existir en varios tipos de evento."""
     client = conectar_db()
-    # Búsqueda exacta o dentro del rango
     res = client.execute("""
-        SELECT * FROM eventos 
-        WHERE folio_inicio = ? OR folio_fin = ? OR (folio_inicio <= ? AND folio_fin >= ?)
-    """, (folio, folio, folio, folio))
-    if res.rows:
-        columnas = [col[0] for col in res.description]
-        return dict(zip(columnas, res.rows[0]))
-    return None
+        SELECT * FROM eventos
+        WHERE folio_inicio <= ? AND folio_fin >= ?
+        ORDER BY anio, tipo_evento, num_paquete
+    """, (folio, folio))
+    columnas = _nombres_columnas(res)
+    return [dict(zip(columnas, fila)) for fila in res.rows]
 
 def buscar_evento_por_general(num_general):
     client = conectar_db()
     res = client.execute("SELECT * FROM eventos WHERE numero_general = ?", (num_general,))
     if res.rows:
-        columnas = [col[0] for col in res.description]
+        columnas = _nombres_columnas(res)
         return dict(zip(columnas, res.rows[0]))
     return None
 
@@ -411,12 +453,25 @@ async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         texto = f"👤 *Tu información*\n\nNombre: {usuario['nombre']}\nRol: `{usuario['rol']}`\nÁrea: `{usuario.get('area', 'enrolamiento')}`\nID: `{usuario['telegram_id']}`{dpi_info}"
         await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
     elif accion == "menu_consulta_enrol":
-        texto = "🔍 *CONSULTAS DPI*\n\nComandos:\n`/buscar <DPI> <N°>`\n`/fecha <DPI> <fecha>`\n`/general <N°>`\n`/usuario <DPI>`\n`/total`"
-        await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
+        btn_en = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔍 Buscar por DPI y N°", callback_data="enrol_buscar")],
+            [InlineKeyboardButton("🔢 Buscar por N° General", callback_data="enrol_general")],
+            [InlineKeyboardButton("📅 Buscar por fecha", callback_data="enrol_fecha")],
+            [InlineKeyboardButton("👤 Paquetes de un usuario", callback_data="enrol_usuario")],
+            [InlineKeyboardButton("📊 Total de paquetes", callback_data="enrol_total")],
+            [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]
+        ])
+        await query.edit_message_text("🔍 *CONSULTAS DPI*\n\nSelecciona cómo buscar:", reply_markup=btn_en, parse_mode="Markdown")
     elif accion == "menu_edicion_enrol":
-        texto = "✏️ *EDICIÓN DPI*\n\nComandos:\n`/registrar`\n`/editar <DPI> <N°> <campo> <valor>`\n`/eliminar <DPI> <N°>`\n`/etiqueta <DPI> <N°>`"
-        await query.edit_message_text(texto, reply_markup=btn_volver, parse_mode="Markdown")
-        
+        btn_en = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Registrar paquete", callback_data="enrol_registrar")],
+            [InlineKeyboardButton("✏️ Editar paquete", callback_data="enrol_editar")],
+            [InlineKeyboardButton("🗑️ Eliminar paquete", callback_data="enrol_eliminar")],
+            [InlineKeyboardButton("🏷️ Generar etiqueta PDF", callback_data="enrol_etiqueta")],
+            [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]
+        ])
+        await query.edit_message_text("✏️ *EDICIÓN DPI*\n\nSelecciona una acción:", reply_markup=btn_en, parse_mode="Markdown")
+
     elif accion == "menu_consulta_reg":
         btn_reg = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔍 Buscar por Evento (DEL/AL)", callback_data="accion_buscar_folio")],
@@ -793,14 +848,24 @@ async def inicio_buscar_folio(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.edit_message_text("🔍 *Buscar por Evento*\n\nEscribe el número (DEL, AL o intermedio):", parse_mode="Markdown")
     return EV_BUS_FOLIO
 
+def texto_evento(res):
+    gen = res.get("numero_general")
+    gen_txt = gen if gen is not None else "En blanco"
+    return (f"📖 Evento encontrado\n\nTipo: {res['tipo_evento']}\nAño: {res['anio']}\n"
+            f"Paquete N°: {res['num_paquete']}\nGen: {gen_txt}\n"
+            f"Eventos: {res['folio_inicio']} al {res['folio_fin']}\n"
+            f"Ubicación: E{res['estanteria']}-F{res['fila']}-{res['columna']}-P{res['pila']}")
+
 async def flujo_buscar_folio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: folio = int(update.message.text.strip())
     except: await update.message.reply_text("⚠️ Debe ser un número entero:"); return EV_BUS_FOLIO
-    res = buscar_evento_por_folio(folio)
+    resultados = buscar_evento_por_folio(folio)
     btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
-    if res:
-        mensaje = f"📖 *Evento Encontrado*\n\nTipo: {res['tipo_evento']}\nAño: {res['anio']}\nPaquete N°: {res['num_paquete']}\nGen: {res.get('numero_general', 'En blanco')}\nEventos: {res['folio_inicio']} al {res['folio_fin']}\nUbicación: E{res['estanteria']}-F{res['fila']}-{res['columna']}-P{res['pila']}"
-        await update.message.reply_text(mensaje, reply_markup=btn_volver, parse_mode="Markdown")
+    if resultados:
+        mensaje = "\n\n".join(texto_evento(r) for r in resultados)
+        if len(resultados) > 1:
+            mensaje = f"ℹ️ El {folio} aparece en {len(resultados)} paquetes:\n\n" + mensaje
+        await update.message.reply_text(mensaje, reply_markup=btn_volver)
     else: await update.message.reply_text(f"❌ No se encontró paquete para el evento {folio}.", reply_markup=btn_volver)
     return ConversationHandler.END
 
@@ -814,9 +879,7 @@ async def flujo_buscar_general(update: Update, context: ContextTypes.DEFAULT_TYP
     except: await update.message.reply_text("⚠️ Debe ser un número entero:"); return EV_BUS_GENERAL
     res = buscar_evento_por_general(num_gen)
     btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
-    if res:
-        mensaje = f"📖 *Evento Encontrado*\n\nTipo: {res['tipo_evento']}\nAño: {res['anio']}\nPaquete N°: {res['num_paquete']}\nGen: {res.get('numero_general', 'En blanco')}\nEventos: {res['folio_inicio']} al {res['folio_fin']}\nUbicación: E{res['estanteria']}-F{res['fila']}-{res['columna']}-P{res['pila']}"
-        await update.message.reply_text(mensaje, reply_markup=btn_volver, parse_mode="Markdown")
+    if res: await update.message.reply_text(texto_evento(res), reply_markup=btn_volver)
     else: await update.message.reply_text(f"❌ No se encontró paquete con N° General {num_gen}.", reply_markup=btn_volver)
     return ConversationHandler.END
 
@@ -871,6 +934,98 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelado.")
     return ConversationHandler.END
 
+async def cancelar_a_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Botón 'Volver/Cancelar' dentro de un flujo: cierra la conversación y muestra el menú."""
+    context.user_data.clear()
+    await update.callback_query.answer()
+    await start(update, context)
+    return ConversationHandler.END
+
+async def totales_anio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    usuario = await verificar_acceso(update)
+    if not usuario: return
+    res = conectar_db().execute("""
+        SELECT anio, tipo_evento, COUNT(*), COALESCE(SUM(folio_fin - folio_inicio + 1), 0)
+        FROM eventos GROUP BY anio, tipo_evento ORDER BY anio, tipo_evento
+    """)
+    btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+    if not res.rows:
+        await query.edit_message_text("📊 Aún no hay paquetes de eventos registrados.", reply_markup=btn_volver); return
+    texto, anio_actual = "📊 Totales por año\n", None
+    for anio, tipo, paquetes, registros in res.rows:
+        if anio != anio_actual:
+            texto += f"\n📅 {anio}\n"; anio_actual = anio
+        texto += f"  • {tipo}: {paquetes} paquete(s), {registros} registro(s)\n"
+    await query.edit_message_text(texto, reply_markup=btn_volver)
+
+async def enrol_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    usuario = await verificar_acceso(update)
+    if not usuario: return
+    btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+    await query.edit_message_text(f"📊 Total de paquetes DPI: {contar_paquetes()}", reply_markup=btn_volver)
+
+# Botones de Enrolamiento: piden los datos y reutilizan los comandos existentes
+ENROL_COMANDOS = {
+    "buscar":   (lambda: buscar,   "🔍 Buscar por DPI y N°",   "<DPI> <N°>",                      "PCOTTON320 1"),
+    "general":  (lambda: general,  "🔢 Buscar por N° General", "<N° general>",                    "41"),
+    "fecha":    (lambda: fecha,    "📅 Buscar por fecha",      "<DPI> <fecha DD/MM/AAAA>",        "PCOTTON320 15/03/2024"),
+    "usuario":  (lambda: usuario_cmd, "👤 Paquetes de un usuario", "<DPI>",                       "PCOTTON320"),
+    "etiqueta": (lambda: etiqueta, "🏷️ Etiqueta PDF",          "<DPI> <N°>",                      "PCOTTON320 1"),
+    "eliminar": (lambda: eliminar, "🗑️ Eliminar paquete",      "<DPI> <N°>",                      "PCOTTON320 1"),
+    "editar":   (lambda: editar,   "✏️ Editar paquete",        "<DPI> <N°> <campo> <valor>\nCampos: fecha_del, fecha_al, estanteria, fila, columna, pila, numero_general", "PCOTTON320 1 fila 3"),
+}
+
+async def enrol_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    usuario = await verificar_acceso(update)
+    if not usuario: return ConversationHandler.END
+    clave = query.data.replace("enrol_", "")
+    _, titulo, formato, ejemplo = ENROL_COMANDOS[clave]
+    context.user_data["enrol_cmd"] = clave
+    await query.edit_message_text(f"{titulo}\n\nEscribe: {formato}\nEjemplo: {ejemplo}\n\n(/cancelar para salir)")
+    return ENROL_ARGS
+
+async def enrol_recibir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clave = context.user_data.pop("enrol_cmd", None)
+    if clave not in ENROL_COMANDOS: return ConversationHandler.END
+    funcion = ENROL_COMANDOS[clave][0]()
+    context.args = update.message.text.split()
+    await funcion(update, context)
+    btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+    await update.message.reply_text("¿Algo más?", reply_markup=btn_volver)
+    return ConversationHandler.END
+
+async def registrar_inicio_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Versión con botón de /registrar (el flujo paso a paso es el mismo)."""
+    query = update.callback_query; await query.answer()
+    usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
+    if not usuario: return ConversationHandler.END
+    context.user_data.clear()
+    if usuario["rol"] == "operador2":
+        context.user_data["dpi"] = usuario["dpi_asignado"]
+        await query.message.reply_text(f"📝 *Registro*\n👤 DPI: `{usuario['dpi_asignado']}`\n\n1️⃣ Fecha *DEL*:", parse_mode="Markdown")
+        return REG_DEL
+    await query.message.reply_text("📝 *Registro paso a paso*\n\n1️⃣ Ingresa el *DPI/código* del usuario:", parse_mode="Markdown")
+    return REG_DPI
+
+async def manejar_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Registra el error en los logs y AVISA en Telegram en vez de quedarse en silencio."""
+    if isinstance(context.error, Conflict):
+        print("⚠️ Conflict: hay otra instancia del bot con el mismo token corriendo.")
+        return
+    print("❌ Error en el bot:")
+    traceback.print_exception(type(context.error), context.error, context.error.__traceback__)
+    try:
+        if isinstance(update, Update):
+            if update.callback_query:
+                await update.callback_query.message.reply_text("❌ Ocurrió un error. Intenta de nuevo o usa /start.")
+            elif update.effective_message:
+                await update.effective_message.reply_text("❌ Ocurrió un error. Intenta de nuevo o usa /start.")
+    except Exception:
+        pass
+
 # ==========================================
 # MAIN Y SERVIDOR WEB PARA RENDER
 # ==========================================
@@ -914,7 +1069,7 @@ if __name__ == "__main__":
     
     # 1. Flujo de Registro Enrolamiento
     conv_registro = ConversationHandler(
-        entry_points=[CommandHandler("registrar", registrar_inicio)],
+        entry_points=[CommandHandler("registrar", registrar_inicio), CallbackQueryHandler(registrar_inicio_cb, pattern="^enrol_registrar$")],
         states={
             REG_DPI: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_dpi)],
             REG_DEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_del)],
@@ -926,7 +1081,7 @@ if __name__ == "__main__":
             REG_PIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_pil)],
             REG_GENERAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_general)],
         },
-        fallbacks=[CommandHandler("cancelar", cancelar)],
+        fallbacks=[CommandHandler("cancelar", cancelar), CallbackQueryHandler(cancelar_a_menu, pattern="^menu_inicio$")],
         per_message=False,
     )
     app.add_handler(conv_registro)
@@ -946,7 +1101,7 @@ if __name__ == "__main__":
             EV_COL: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_col)],
             EV_PIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_pil)],
         },
-        fallbacks=[CommandHandler("cancelar", cancelar)],
+        fallbacks=[CommandHandler("cancelar", cancelar), CallbackQueryHandler(cancelar_a_menu, pattern="^menu_inicio$")],
         per_message=False,
     )
     app.add_handler(conv_evento)
@@ -955,7 +1110,7 @@ if __name__ == "__main__":
     conv_bus_folio = ConversationHandler(
         entry_points=[CallbackQueryHandler(inicio_buscar_folio, pattern="^accion_buscar_folio$")],
         states={EV_BUS_FOLIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_buscar_folio)]},
-        fallbacks=[CommandHandler("cancelar", cancelar)],
+        fallbacks=[CommandHandler("cancelar", cancelar), CallbackQueryHandler(cancelar_a_menu, pattern="^menu_inicio$")],
         per_message=False,
     )
     app.add_handler(conv_bus_folio)
@@ -964,7 +1119,7 @@ if __name__ == "__main__":
     conv_bus_general = ConversationHandler(
         entry_points=[CallbackQueryHandler(inicio_buscar_general, pattern="^accion_buscar_general$")],
         states={EV_BUS_GENERAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_buscar_general)]},
-        fallbacks=[CommandHandler("cancelar", cancelar)],
+        fallbacks=[CommandHandler("cancelar", cancelar), CallbackQueryHandler(cancelar_a_menu, pattern="^menu_inicio$")],
         per_message=False,
     )
     app.add_handler(conv_bus_general)
@@ -977,13 +1132,25 @@ if __name__ == "__main__":
             EV_EDIT_CAMPO: [CallbackQueryHandler(flujo_edit_campo, pattern="^campo_")],
             EV_EDIT_VALOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_edit_valor)],
         },
-        fallbacks=[CommandHandler("cancelar", cancelar)],
+        fallbacks=[CommandHandler("cancelar", cancelar), CallbackQueryHandler(cancelar_a_menu, pattern="^menu_inicio$")],
         per_message=False,
     )
     app.add_handler(conv_edit_evento)
     
+    # 5b. Consultas y ediciones de Enrolamiento con botones
+    conv_enrol = ConversationHandler(
+        entry_points=[CallbackQueryHandler(enrol_inicio, pattern="^enrol_(buscar|general|fecha|usuario|etiqueta|eliminar|editar)$")],
+        states={ENROL_ARGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, enrol_recibir)]},
+        fallbacks=[CommandHandler("cancelar", cancelar), CallbackQueryHandler(cancelar_a_menu, pattern="^menu_inicio$")],
+        per_message=False,
+    )
+    app.add_handler(conv_enrol)
+    app.add_handler(CallbackQueryHandler(enrol_total, pattern="^enrol_total$"))
+    app.add_handler(CallbackQueryHandler(totales_anio, pattern="^accion_totales_anio$"))
+
     # 6. MANEJADOR DE BOTONES DEL MENÚ
     app.add_handler(CallbackQueryHandler(botones_menu, pattern="^menu_"))
     
     print("✅ Bot activo. Presiona /start en Telegram.")
-    app.run_polling()
+    app.add_error_handler(manejar_error)
+    app.run_polling(drop_pending_updates=True)
