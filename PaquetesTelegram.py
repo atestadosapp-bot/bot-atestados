@@ -29,6 +29,7 @@ ADMIN_INICIAL_ID = 6491907692
 (EV_BUS_FOLIO, EV_BUS_GENERAL) = range(30, 32)
 (EV_EDIT_GENERAL, EV_EDIT_CAMPO, EV_EDIT_VALOR) = range(32, 35) # Nuevos estados para edición
 ENROL_ARGS = 40  # Estado para las consultas/ediciones de Enrolamiento con botones
+(EV_EDIT_MODO, EV_EDIT_ELEGIR) = range(41, 43)  # Edición de eventos: cómo buscar y cuál elegir
 
 # ==========================================
 # CONEXIÓN A LA BASE DE DATOS (TURSO)
@@ -326,6 +327,40 @@ def actualizar_evento(num_general, campo, valor):
     except Exception as e:
         print(f"Error actualizar evento: {e}")
         return False
+
+CAMPOS_EVENTO_EDITABLES = ["tipo_evento", "anio", "num_paquete", "folio_inicio", "folio_fin",
+                           "numero_general", "estanteria", "fila", "columna", "pila"]
+
+def buscar_evento_por_id(id_evento):
+    res = conectar_db().execute("SELECT * FROM eventos WHERE id = ?", (id_evento,))
+    if res.rows:
+        return dict(zip(_nombres_columnas(res), res.rows[0]))
+    return None
+
+def actualizar_evento_id(id_evento, campo, valor):
+    """Actualiza un campo del paquete identificado por su id interno. Devuelve (ok, mensaje_error)."""
+    if campo not in CAMPOS_EVENTO_EDITABLES:
+        return False, "Campo no editable."
+    client = conectar_db()
+    try:
+        if valor.lower() in ("blanco", "null", ""):
+            if campo != "numero_general":
+                return False, "Solo el N° General puede quedar en blanco."
+            valor_final = None
+        elif campo in ("anio", "num_paquete", "folio_inicio", "folio_fin", "numero_general"):
+            valor_final = int(valor)
+        else:
+            valor_final = valor
+        if campo == "numero_general" and valor_final is not None:
+            r = client.execute("SELECT COUNT(*) FROM eventos WHERE numero_general = ? AND id <> ?", (valor_final, id_evento))
+            if r.rows[0][0] > 0:
+                return False, f"El N° General {valor_final} ya está en uso por otro paquete."
+        client.execute(f"UPDATE eventos SET {campo} = ? WHERE id = ?", (valor_final, id_evento))
+        return True, None
+    except ValueError:
+        return False, "Ese campo requiere un número entero."
+    except Exception as e:
+        return False, f"No se pudo guardar (¿ya existe ese Tipo/Año/Paquete?): {e}"
 
 # ==========================================
 # UTILIDADES
@@ -884,48 +919,91 @@ async def flujo_buscar_general(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 # --- EDICIÓN DE EVENTOS ---
-async def inicio_editar_evento(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    await query.edit_message_text("✏️ *Editar Paquete de Evento*\n\nEscribe el *Número General* del paquete que deseas editar:", parse_mode="Markdown")
-    return EV_EDIT_GENERAL
-
-async def flujo_edit_general(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try: num_gen = int(update.message.text.strip())
-    except: await update.message.reply_text("⚠️ Debe ser un número entero:"); return EV_EDIT_GENERAL
-    
-    res = buscar_evento_por_general(num_gen)
-    if not res:
-        await update.message.reply_text(f"❌ No se encontró paquete con N° General {num_gen}. Intenta otro o /cancelar:")
-        return EV_EDIT_GENERAL
-    
-    context.user_data["edit_gen"] = num_gen
-    teclado = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Año", callback_data="campo_anio"), InlineKeyboardButton("Paquete", callback_data="campo_num_paquete")],
+def teclado_campos_evento():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("N° General", callback_data="campo_numero_general")],
+        [InlineKeyboardButton("Tipo de evento", callback_data="campo_tipo_evento"), InlineKeyboardButton("Año", callback_data="campo_anio")],
+        [InlineKeyboardButton("Paquete", callback_data="campo_num_paquete")],
         [InlineKeyboardButton("Evento DEL", callback_data="campo_folio_inicio"), InlineKeyboardButton("Evento AL", callback_data="campo_folio_fin")],
         [InlineKeyboardButton("Estantería", callback_data="campo_estanteria"), InlineKeyboardButton("Fila", callback_data="campo_fila")],
         [InlineKeyboardButton("Columna", callback_data="campo_columna"), InlineKeyboardButton("Pila", callback_data="campo_pila")],
         [InlineKeyboardButton("🔙 Cancelar", callback_data="menu_inicio")]
     ])
-    await update.message.reply_text(f"✅ Paquete encontrado (Tipo: {res['tipo_evento']}, Año: {res['anio']}).\n\n¿Qué campo deseas editar?", reply_markup=teclado)
+
+async def inicio_editar_evento(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    context.user_data.clear()
+    teclado = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔢 Por N° de registro (evento)", callback_data="edmodo_folio")],
+        [InlineKeyboardButton("📋 Por N° General", callback_data="edmodo_general")],
+        [InlineKeyboardButton("🔙 Cancelar", callback_data="menu_inicio")]
+    ])
+    await query.edit_message_text("✏️ Editar Paquete de Evento\n\n¿Cómo quieres buscar el paquete?\n(Si aún no tiene N° General, usa el N° de registro.)", reply_markup=teclado)
+    return EV_EDIT_MODO
+
+async def flujo_edit_modo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    modo = query.data.replace("edmodo_", "")
+    context.user_data["edit_modo"] = modo
+    etiqueta = "N° de registro (cualquier número dentro del rango DEL-AL del paquete)" if modo == "folio" else "N° General"
+    await query.edit_message_text(f"Escribe el {etiqueta}:")
+    return EV_EDIT_GENERAL
+
+def _resumen_corto(r):
+    gen = r.get("numero_general")
+    return f"{r['tipo_evento']} {r['anio']} · Paq {r['num_paquete']} · {r['folio_inicio']}-{r['folio_fin']} · Gen {gen if gen is not None else '—'}"
+
+async def _mostrar_campos_edicion(mensaje, context, paquete):
+    context.user_data["edit_id"] = paquete["id"]
+    await mensaje.reply_text(f"✅ Paquete seleccionado:\n{texto_evento(paquete)}\n\n¿Qué campo deseas editar?", reply_markup=teclado_campos_evento())
+
+async def flujo_edit_general(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: numero = int(update.message.text.strip())
+    except: await update.message.reply_text("⚠️ Debe ser un número entero:"); return EV_EDIT_GENERAL
+    modo = context.user_data.get("edit_modo", "folio")
+    if modo == "general":
+        r = buscar_evento_por_general(numero)
+        resultados = [r] if r else []
+    else:
+        resultados = buscar_evento_por_folio(numero)
+    if not resultados:
+        await update.message.reply_text(f"❌ No se encontró ningún paquete con ese número ({numero}). Intenta otro o /cancelar:")
+        return EV_EDIT_GENERAL
+    if len(resultados) == 1:
+        await _mostrar_campos_edicion(update.message, context, resultados[0])
+        return EV_EDIT_CAMPO
+    botones = [[InlineKeyboardButton(_resumen_corto(r), callback_data=f"edsel_{r['id']}")] for r in resultados]
+    botones.append([InlineKeyboardButton("🔙 Cancelar", callback_data="menu_inicio")])
+    await update.message.reply_text(f"El {numero} aparece en {len(resultados)} paquetes. ¿Cuál quieres editar?", reply_markup=InlineKeyboardMarkup(botones))
+    return EV_EDIT_ELEGIR
+
+async def flujo_edit_elegir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    paquete = buscar_evento_por_id(int(query.data.replace("edsel_", "")))
+    if not paquete:
+        await query.edit_message_text("❌ Ese paquete ya no existe."); return ConversationHandler.END
+    await query.edit_message_reply_markup(reply_markup=None)
+    await _mostrar_campos_edicion(query.message, context, paquete)
     return EV_EDIT_CAMPO
 
 async def flujo_edit_campo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     campo = query.data.replace("campo_", "")
     context.user_data["edit_campo"] = campo
-    await query.edit_message_text(f"Has seleccionado editar: *{campo}*.\n\nPor favor, escribe el nuevo valor:", parse_mode="Markdown")
+    extra = "\n(Escribe 'blanco' para dejarlo vacío.)" if campo == "numero_general" else ""
+    await query.edit_message_text(f"Has seleccionado editar: {campo}.\n\nEscribe el nuevo valor:{extra}")
     return EV_EDIT_VALOR
 
 async def flujo_edit_valor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     valor = update.message.text.strip()
-    num_gen = context.user_data.get("edit_gen")
+    id_evento = context.user_data.get("edit_id")
     campo = context.user_data.get("edit_campo")
-    
-    if actualizar_evento(num_gen, campo, valor):
-        await update.message.reply_text(f"✅ El campo *{campo}* del paquete N° General {num_gen} ha sido actualizado a: `{valor}`.", parse_mode="Markdown")
+    ok, error = actualizar_evento_id(id_evento, campo, valor)
+    btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+    if ok:
+        await update.message.reply_text(f"✅ {campo} actualizado a: {valor}", reply_markup=btn_volver)
     else:
-        await update.message.reply_text(f"❌ No se pudo actualizar. Verifica que el valor sea correcto.")
-    
+        await update.message.reply_text(f"❌ {error}", reply_markup=btn_volver)
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1128,7 +1206,9 @@ if __name__ == "__main__":
     conv_edit_evento = ConversationHandler(
         entry_points=[CallbackQueryHandler(inicio_editar_evento, pattern="^accion_editar_evento$")],
         states={
+            EV_EDIT_MODO: [CallbackQueryHandler(flujo_edit_modo, pattern="^edmodo_")],
             EV_EDIT_GENERAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_edit_general)],
+            EV_EDIT_ELEGIR: [CallbackQueryHandler(flujo_edit_elegir, pattern="^edsel_")],
             EV_EDIT_CAMPO: [CallbackQueryHandler(flujo_edit_campo, pattern="^campo_")],
             EV_EDIT_VALOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_edit_valor)],
         },
