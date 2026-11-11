@@ -546,9 +546,11 @@ async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif accion == "menu_consulta_reg":
         btn_reg = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔍 Buscar por Folio", callback_data="accion_buscar_folio")],
+            [InlineKeyboardButton("📊 Totales por Año", callback_data="accion_totales_anio")],
             [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]
         ])
         await query.edit_message_text("📖 *CONSULTAS DE EVENTOS*\n\nSelecciona cómo buscar:", reply_markup=btn_reg, parse_mode="Markdown")
+    
     elif accion == "menu_edicion_reg":
         btn_reg = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Registrar Evento", callback_data="accion_registrar_evento")],
@@ -929,6 +931,8 @@ async def inicio_registrar_evento(update: Update, context: ContextTypes.DEFAULT_
         [InlineKeyboardButton("👶 Nacimiento", callback_data="tipo_Nacimiento")],
         [InlineKeyboardButton("💍 Matrimonio", callback_data="tipo_Matrimonio")],
         [InlineKeyboardButton("⚰️ Defunción", callback_data="tipo_Defuncion")],
+        [InlineKeyboardButton("💔 Divorcio", callback_data="tipo_Divorcio")],
+        [InlineKeyboardButton("🚫 Negativa", callback_data="tipo_Negativa")],
         [InlineKeyboardButton("🔙 Cancelar", callback_data="menu_inicio")]
     ])
     await query.edit_message_text("📝 *Registrar Evento*\n\nSelecciona el tipo:", reply_markup=teclado, parse_mode="Markdown")
@@ -1030,6 +1034,8 @@ async def flujo_buscar_folio(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return EV_BUS_FOLIO
     
     res = buscar_evento_por_folio(folio)
+    btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+    
     if res:
         mensaje = (f"📖 *Evento Encontrado*\n\n"
                    f"Tipo: {res['tipo_evento']}\n"
@@ -1037,9 +1043,10 @@ async def flujo_buscar_folio(update: Update, context: ContextTypes.DEFAULT_TYPE)
                    f"Paquete N°: {res['num_paquete']}\n"
                    f"Rango: {res['folio_inicio']} al {res['folio_fin']}\n"
                    f"Ubicación: E{res['estanteria']}-F{res['fila']}-{res['columna']}-P{res['pila']}")
-        await update.message.reply_text(mensaje, parse_mode="Markdown")
+        await update.message.reply_text(mensaje, reply_markup=btn_volver, parse_mode="Markdown")
     else:
-        await update.message.reply_text(f"❌ No se encontró ningún paquete con el folio {folio}.")
+        await update.message.reply_text(f"❌ No se encontró ningún paquete con el folio {folio}.", reply_markup=btn_volver)
+    
     return ConversationHandler.END
 
 async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1090,7 +1097,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("autorizar", autorizar))
     app.add_handler(CommandHandler("lista_autorizados", lista_autorizados))
     
-    # Flujo de Registro Enrolamiento
+    # 1. Flujo de Registro Enrolamiento
     conv_registro = ConversationHandler(
         entry_points=[CommandHandler("registrar", registrar_inicio)],
         states={
@@ -1109,7 +1116,7 @@ if __name__ == "__main__":
     )
     app.add_handler(conv_registro)
 
-    # Flujo de Registro Eventos
+    # 2. Flujo de Registro Eventos
     conv_evento = ConversationHandler(
         entry_points=[CallbackQueryHandler(inicio_registrar_evento, pattern="^accion_registrar_evento$")],
         states={
@@ -1128,7 +1135,7 @@ if __name__ == "__main__":
     )
     app.add_handler(conv_evento)
 
-    # Flujo de Búsqueda por Folio
+    # 3. Flujo de Búsqueda por Folio
     conv_bus_folio = ConversationHandler(
         entry_points=[CallbackQueryHandler(inicio_buscar_folio, pattern="^accion_buscar_folio$")],
         states={
@@ -1139,8 +1146,8 @@ if __name__ == "__main__":
     )
     app.add_handler(conv_bus_folio)
     
-    # MANEJADOR DE BOTONES DEL MENÚ (Con filtro para que no interfiera con los eventos)
-    app.add_handler(CallbackQueryHandler(botones_menu, pattern="^(menu_|accion_buscar_folio$)"))
+    # 4. MANEJADOR DE BOTONES DEL MENÚ (Filtrado para que no interfiera con los flujos)
+    app.add_handler(CallbackQueryHandler(botones_menu, pattern="^menu_"))
     
     print("✅ Bot activo. Presiona /start en Telegram.")
     app.run_polling()
