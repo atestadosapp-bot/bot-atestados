@@ -32,6 +32,8 @@ ADMIN_INICIAL_ID = 6491907692
 ENROL_ARGS = 40  # Estado para las consultas/ediciones de Enrolamiento con botones
 (EV_EDIT_MODO, EV_EDIT_ELEGIR) = range(41, 43)  # Edición de eventos: cómo buscar y cuál elegir
 (EV_EDIT_CONFIRMAR, EV_FILTRO_ARGS) = range(43, 45)  # Confirmar eliminación / filtros de consulta
+REG_UBIC = 45  # Registro de enrolamiento: confirmar ubicación sugerida
+(EP_MODO, EP_VALOR, EP_ELEGIR, EP_CAMPO, EP_NUEVO, EP_CONFIRMAR) = range(46, 52)  # Buscar / editar / etiqueta / eliminar (enrolamiento)
 
 # ==========================================
 # CONEXIÓN A LA BASE DE DATOS (TURSO)
@@ -245,6 +247,74 @@ def insertar_paquete(dpi, num, f_del, f_al, est, fil, col, pil, general=None):
         if "UNIQUE" in str(e).upper():
             return (None, f"Ya existe el paquete N° {num} para el usuario {dpi}.")
         return (None, f"Error ({type(e).__name__}): {e}")
+
+def siguiente_num_paquete_usuario(dpi):
+    r = conectar_db().execute("SELECT MAX(num_paquete) FROM paquetes WHERE usuario_codigo = ?", (dpi,))
+    return (r.rows[0][0] or 0) + 1
+
+def siguiente_general_enrol():
+    r = conectar_db().execute("SELECT MAX(numero_general) FROM paquetes")
+    return (r.rows[0][0] or 0) + 1
+
+def ultima_ubicacion_usuario(dpi):
+    """Ubicación del último paquete (mayor N°) del usuario: (est, fila, col, pila, num) o None."""
+    r = conectar_db().execute("""SELECT estanteria, fila, columna, pila, num_paquete FROM paquetes
+                                 WHERE usuario_codigo = ? ORDER BY num_paquete DESC LIMIT 1""", (dpi,))
+    return tuple(r.rows[0]) if r.rows else None
+
+def paquete_en_ubicacion(est, fil, col, pil, excluir=None):
+    """Devuelve (usuario, num_paquete) del paquete que ocupa esa ubicación, o None."""
+    r = conectar_db().execute("""SELECT usuario_codigo, num_paquete FROM paquetes
+                                 WHERE estanteria = ? AND fila = ? AND columna = ? AND pila = ?""", (est, fil, col, pil))
+    for fila_ in r.rows:
+        if excluir and (fila_[0], fila_[1]) == excluir: continue
+        return (fila_[0], fila_[1])
+    return None
+
+CAMPOS_ENROL_EDITABLES = ["numero_general", "fecha_del", "fecha_al", "num_paquete", "estanteria", "fila", "columna", "pila"]
+
+def actualizar_paquete_clave(dpi, num, campo, valor):
+    """Actualiza un campo del paquete (dpi + N°). Devuelve (ok, mensaje, num_vigente)."""
+    if campo not in CAMPOS_ENROL_EDITABLES: return False, "Campo no editable.", num
+    client = conectar_db()
+    try:
+        actual = buscar_por_dpi_y_numero(dpi, num)
+        if not actual: return False, "El paquete ya no existe.", num
+        valor = valor.strip()
+        if campo in ("fecha_del", "fecha_al"):
+            v = normalizar_fecha(valor)
+            if not v: return False, "Fecha inválida. Usa DD/MM/AAAA o AAAA-MM-DD.", num
+            if campo == "fecha_al" and actual.get("fecha_del") and v < actual["fecha_del"]:
+                return False, "La fecha AL no puede ser anterior a la fecha DEL.", num
+            if campo == "fecha_del" and actual.get("fecha_al") and v > actual["fecha_al"]:
+                return False, "La fecha DEL no puede ser posterior a la fecha AL.", num
+        elif campo == "numero_general":
+            if valor.lower() in ("blanco", "null", ""): v = None
+            else:
+                v = int(valor)
+                r = client.execute("SELECT COUNT(*) FROM paquetes WHERE numero_general = ? AND NOT (usuario_codigo = ? AND num_paquete = ?)", (v, dpi, num))
+                if r.rows[0][0] > 0: return False, f"El N° General {v} ya está en uso por otro paquete.", num
+        elif campo == "num_paquete":
+            v = int(valor)
+            if v != num and buscar_por_dpi_y_numero(dpi, v): return False, f"Ya existe el paquete N° {v} para este usuario.", num
+        elif campo == "columna":
+            v = valor.upper()
+            if v not in ("A", "B", "C", "D"): return False, "La columna debe ser A, B, C o D.", num
+        else:
+            v = valor
+        client.execute(f"UPDATE paquetes SET {campo} = ? WHERE usuario_codigo = ? AND num_paquete = ?", (v, dpi, num))
+        nuevo_num = v if campo == "num_paquete" else num
+        aviso = None
+        if campo in ("estanteria", "fila", "columna", "pila"):
+            act = buscar_por_dpi_y_numero(dpi, nuevo_num)
+            ocup = paquete_en_ubicacion(act["estanteria"], act["fila"], act["columna"], act["pila"], excluir=(dpi, nuevo_num)) if act else None
+            if ocup: aviso = f"⚠️ Esa ubicación también la ocupa el paquete N° {ocup[1]} de {ocup[0]}."
+        return True, aviso, nuevo_num
+    except ValueError:
+        return False, "Ese campo requiere un número entero.", num
+    except Exception as e:
+        traceback.print_exc()
+        return False, f"Error ({type(e).__name__}): {e}", num
 
 def eliminar_paquete(dpi, num):
     client = conectar_db()
@@ -837,7 +907,7 @@ async def reg_dpi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not codigo: await update.message.reply_text("⚠️ Intenta de nuevo:"); return REG_DPI
     if not usuario_existe(codigo): await update.message.reply_text(f"❌ El código `{codigo}` no está registrado.\nIntenta otro o /cancelar:", parse_mode="Markdown"); return REG_DPI
     context.user_data["dpi"] = codigo
-    await update.message.reply_text("2️⃣ Fecha *DEL* (AAAA-MM-DD o DD/MM/AAAA):")
+    await update.message.reply_text("2️⃣ Fecha DEL (AAAA-MM-DD o DD/MM/AAAA):")
     return REG_DEL
 
 async def reg_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -850,46 +920,110 @@ async def reg_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reg_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fecha = normalizar_fecha(update.message.text.strip())
     if not fecha: await update.message.reply_text("⚠️ Fecha inválida:"); return REG_AL
-    context.user_data["fecha_al"] = fecha
-    await update.message.reply_text("4️⃣ *Número de paquete*:")
+    d = context.user_data
+    if d.get("fecha_del") and fecha < d["fecha_del"]:
+        await update.message.reply_text("⚠️ La fecha AL no puede ser anterior a la fecha DEL. Escribe la fecha AL de nuevo:"); return REG_AL
+    d["fecha_al"] = fecha
+    sug = siguiente_num_paquete_usuario(d["dpi"])
+    d["sug_num"] = sug
+    await update.message.reply_text(f"Usuario {d['dpi']}\n\nEl siguiente paquete sería el N° {sug}.\n¿Es correcto?",
+                                    reply_markup=teclado_sugerencia("rsugnum", sug))
+    return REG_NUM
+
+async def _reg_pedir_ubicacion(update, context):
+    d = context.user_data
+    ult = ultima_ubicacion_usuario(d["dpi"])
+    if not ult:
+        await _responder(update, f"Paquete N° {d['num_paquete']}.\n\n5️⃣ Estantería:")
+        return REG_EST
+    est, fil, col, pil, num_ult = ult
+    sug_pila = str(int(pil) + 1) if str(pil).isdigit() else str(pil)
+    d["sug_ubic"] = (str(est), str(fil), str(col), sug_pila)
+    ubic = f"E{est}-F{fil}-{col}-P{sug_pila}"
+    texto = f"Paquete N° {d['num_paquete']}.\n\nEl último paquete de este usuario (N° {num_ult}) está en E{est}-F{fil}-{col}-P{pil}.\nUbicación sugerida: {ubic}"
+    ocup = paquete_en_ubicacion(*d["sug_ubic"])
+    if ocup: texto += f"\n⚠️ Esa ubicación ya la ocupa el paquete N° {ocup[1]} de {ocup[0]}."
+    texto += "\n¿Usar esta ubicación?"
+    await _responder(update, texto, teclado_sugerencia("rsugubi", ubic))
+    return REG_UBIC
+
+async def _reg_pedir_general(update, context):
+    sug = siguiente_general_enrol()
+    context.user_data["sug_gen"] = sug
+    await _responder(update, f"El siguiente N° General correlativo sería {sug}.\n¿Es correcto?",
+                     teclado_sugerencia("rsuggen", sug, extra=[InlineKeyboardButton("⬜ Dejar en blanco", callback_data="rsuggen_blanco")]))
+    return REG_GENERAL
+
+async def reg_num_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    if query.data == "rsugnum_si":
+        context.user_data["num_paquete"] = context.user_data["sug_num"]
+        return await _reg_pedir_ubicacion(update, context)
+    await query.edit_message_text("4️⃣ Escribe el número de paquete:")
     return REG_NUM
 
 async def reg_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: num = int(update.message.text.strip())
     except: await update.message.reply_text("⚠️ Debe ser número:"); return REG_NUM
-    context.user_data["num_paquete"] = num
-    await update.message.reply_text("5️⃣ *Estantería*:")
+    d = context.user_data
+    if buscar_por_dpi_y_numero(d["dpi"], num):
+        await update.message.reply_text(f"⚠️ El usuario {d['dpi']} ya tiene el paquete N° {num}. Escribe otro número:"); return REG_NUM
+    d["num_paquete"] = num
+    return await _reg_pedir_ubicacion(update, context)
+
+async def reg_ubic_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    d = context.user_data
+    if query.data == "rsugubi_si":
+        d["estanteria"], d["fila"], d["columna"], d["pila"] = d["sug_ubic"]
+        return await _reg_pedir_general(update, context)
+    await query.edit_message_text("5️⃣ Estantería:")
     return REG_EST
 
 async def reg_est(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["estanteria"] = update.message.text.strip()
-    await update.message.reply_text("6️⃣ *Fila*:")
+    await update.message.reply_text("6️⃣ Fila:")
     return REG_FIL
 
 async def reg_fil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["fila"] = update.message.text.strip()
-    await update.message.reply_text("7️⃣ *Columna* (A, B, C, D):")
+    await update.message.reply_text("7️⃣ Columna (A, B, C, D):")
     return REG_COL
 
 async def reg_col(update: Update, context: ContextTypes.DEFAULT_TYPE):
     col = update.message.text.strip().upper()
     if col not in ["A", "B", "C", "D"]: await update.message.reply_text("⚠️ Debe ser A, B, C o D:"); return REG_COL
     context.user_data["columna"] = col
-    await update.message.reply_text("8️⃣ *Pila/Nivel*:")
+    await update.message.reply_text("8️⃣ Pila/Nivel:")
     return REG_PIL
 
 async def reg_pil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["pila"] = update.message.text.strip()
-    await update.message.reply_text("9️⃣ *Número general* (número, 'auto' o 'blanco'):")
-    return REG_GENERAL
+    return await _reg_pedir_general(update, context)
+
+async def _reg_guardar(update, context, general):
+    datos = context.user_data
+    nuevo_gen, error = insertar_paquete(datos["dpi"], datos["num_paquete"], datos["fecha_del"], datos["fecha_al"], datos["estanteria"], datos["fila"], datos["columna"], datos["pila"], general)
+    btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+    if error:
+        await _responder(update, f"❌ {error}\n\nReintenta desde el menú o con /registrar", btn_volver)
+    else:
+        gen_texto = str(nuevo_gen) if nuevo_gen is not None else "En blanco"
+        ubic = f"E{datos['estanteria']}-F{datos['fila']}-{datos['columna']}-P{datos['pila']}"
+        await _responder(update, f"✅ Registrado\n📦 N°: {datos['num_paquete']}\n🔢 Gen: {gen_texto}\n📍 {ubic}\n👤 {datos['dpi']}", btn_volver)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def reg_general_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    if query.data == "rsuggen_otro":
+        await query.edit_message_text("Escribe el Número General (número, 'auto' o 'blanco'):")
+        return REG_GENERAL
+    general = str(context.user_data["sug_gen"]) if query.data == "rsuggen_si" else "blanco"
+    return await _reg_guardar(update, context, general)
 
 async def reg_general(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    general, datos = update.message.text.strip(), context.user_data
-    nuevo_gen, error = insertar_paquete(datos["dpi"], datos["num_paquete"], datos["fecha_del"], datos["fecha_al"], datos["estanteria"], datos["fila"], datos["columna"], datos["pila"], general)
-    if error: await update.message.reply_text(f"❌ {error}\n\nReintenta con /registrar"); context.user_data.clear(); return ConversationHandler.END
-    gen_texto = f"`{nuevo_gen}`" if nuevo_gen is not None else "_En blanco_"
-    await update.message.reply_text(f"✅ *Registrado*\n📦 N°: {datos['num_paquete']}\n🔢 Gen: {gen_texto}\n👤 `{datos['dpi']}`", parse_mode="Markdown")
-    context.user_data.clear(); return ConversationHandler.END
+    return await _reg_guardar(update, context, update.message.text.strip())
 
 async def registrar_directo(update: Update, context: ContextTypes.DEFAULT_TYPE, usuario):
     if len(context.args) not in (8, 9): return ConversationHandler.END
@@ -1313,6 +1447,191 @@ async def evf_recibir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
+# --- ENROLAMIENTO: buscar por botones y luego editar / etiqueta / eliminar ---
+TITULOS_ACCION_ENROL = {"editar": "✏️ Editar paquete", "etiqueta": "🏷️ Generar etiqueta PDF", "eliminar": "🗑️ Eliminar paquete"}
+CAMPOS_ENROL_BOTONES = [("N° General", "numero_general"), ("Fecha DEL", "fecha_del"), ("Fecha AL", "fecha_al"),
+                        ("N° de paquete", "num_paquete"), ("Estantería", "estanteria"), ("Fila", "fila"),
+                        ("Columna", "columna"), ("Pila", "pila")]
+
+def fecha_mostrar(f):
+    try:
+        a_, m_, d_ = str(f).split("-"); return f"{d_}/{m_}/{a_}"
+    except Exception:
+        return str(f)
+
+def texto_paquete_enrol(r):
+    gen = r.get("numero_general")
+    return (f"📦 Paquete N° {r.get('num_paquete')}\n👤 {r.get('usuario_codigo')}\n🔢 Gen: {gen if gen is not None else 'En blanco'}\n"
+            f"📅 {fecha_mostrar(r.get('fecha_del'))} al {fecha_mostrar(r.get('fecha_al'))}\n📍 {r.get('ubicacion_armada')}")
+
+def resumen_paquete_enrol(r):
+    gen = r.get("numero_general")
+    return f"{r['usuario_codigo']} · N° {r['num_paquete']} · Gen {gen if gen is not None else '—'} · {fecha_mostrar(r['fecha_del'])}-{fecha_mostrar(r['fecha_al'])}"
+
+def teclado_campos_enrol():
+    filas = []
+    for i in range(0, len(CAMPOS_ENROL_BOTONES), 2):
+        filas.append([InlineKeyboardButton(t, callback_data=f"epcampo_{c}") for t, c in CAMPOS_ENROL_BOTONES[i:i + 2]])
+    filas.append([InlineKeyboardButton("✅ Terminar", callback_data="menu_inicio")])
+    return InlineKeyboardMarkup(filas)
+
+async def enrol_sel_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"] if query.data != "enrol_etiqueta" else None)
+    if not usuario: return ConversationHandler.END
+    accion = query.data.replace("enrol_", "")
+    context.user_data.clear()
+    context.user_data["ep_accion"] = accion
+    teclado = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 Por DPI y N° de paquete", callback_data="epmodo_dpinum")],
+        [InlineKeyboardButton("🔢 Por N° General", callback_data="epmodo_general")],
+        [InlineKeyboardButton("📅 Por DPI y fecha", callback_data="epmodo_fecha")],
+        [InlineKeyboardButton("👥 Paquetes de un usuario", callback_data="epmodo_usuario")],
+        [InlineKeyboardButton("🔙 Cancelar", callback_data="menu_inicio")]
+    ])
+    await query.edit_message_text(f"{TITULOS_ACCION_ENROL[accion]}\n\n¿Cómo quieres buscar el paquete?", reply_markup=teclado)
+    return EP_MODO
+
+EP_PROMPTS = {
+    "dpinum":  "Escribe: <DPI> <N° de paquete>\nEjemplo: PCOTTON320 1",
+    "general": "Escribe el N° General\nEjemplo: 41",
+    "fecha":   "Escribe: <DPI> <fecha>\nEjemplo: PCOTTON320 15/03/2024",
+    "usuario": "Escribe el DPI / código del usuario\nEjemplo: PCOTTON320",
+}
+
+async def enrol_sel_modo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    modo = query.data.replace("epmodo_", "")
+    context.user_data["ep_modo"] = modo
+    await query.edit_message_text(EP_PROMPTS[modo] + "\n\n(/cancelar para salir)")
+    return EP_VALOR
+
+async def _ep_continuar(mensaje, context, paquete, usuario_rol=None):
+    d = context.user_data
+    d["ep_dpi"], d["ep_num"] = paquete["usuario_codigo"], paquete["num_paquete"]
+    accion = d.get("ep_accion", "editar")
+    btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+    if accion == "etiqueta":
+        await _enviar_etiqueta_paquete(mensaje, paquete)
+        await mensaje.reply_text("¿Algo más?", reply_markup=btn_volver)
+        d.clear(); return ConversationHandler.END
+    if accion == "eliminar":
+        teclado = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ Sí, eliminar", callback_data="epdel_si")],
+            [InlineKeyboardButton("🔙 Cancelar", callback_data="menu_inicio")]
+        ])
+        await mensaje.reply_text(f"⚠️ ¿Eliminar este paquete?\n\n{texto_paquete_enrol(paquete)}\n\nEsta acción no se puede deshacer.", reply_markup=teclado)
+        return EP_CONFIRMAR
+    await mensaje.reply_text(f"✅ Paquete seleccionado:\n{texto_paquete_enrol(paquete)}\n\n¿Qué campo deseas modificar?", reply_markup=teclado_campos_enrol())
+    return EP_CAMPO
+
+async def _enviar_etiqueta_paquete(mensaje, res):
+    dpi, num_real = res.get("usuario_codigo"), res.get("num_paquete")
+    ruta, error = generar_pdf_etiqueta(dpi, res.get("fecha_del"), res.get("fecha_al"), num_real, res.get("numero_general"), res.get("ubicacion_armada"))
+    if not ruta:
+        await mensaje.reply_text(f"❌ Error al generar PDF: {error}"); return
+    with open(ruta, "rb") as f:
+        await mensaje.reply_document(document=f, filename=f"etiqueta_{dpi}_{num_real}_{datetime.now().strftime('%H%M%S')}.pdf",
+                                     caption=f"🏷️ Etiqueta del Paquete N° {num_real}\n👤 {dpi}\n📅 {res.get('fecha_del')} al {res.get('fecha_al')}\n📍 {res.get('ubicacion_armada')}")
+    os.remove(ruta)
+
+async def enrol_sel_valor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update)
+    if not usuario: return ConversationHandler.END
+    texto = update.message.text.strip()
+    partes = texto.split()
+    modo = context.user_data.get("ep_modo", "dpinum")
+    resultados, error = [], None
+    try:
+        if modo == "dpinum":
+            if len(partes) != 2: error = "Escribe: <DPI> <N° de paquete>"
+            else:
+                r = buscar_por_dpi_y_numero(partes[0], int(partes[1])); resultados = [r] if r else []
+        elif modo == "general":
+            r = buscar_por_numero_general(int(texto)); resultados = [r] if r else []
+        elif modo == "fecha":
+            f = normalizar_fecha(partes[1]) if len(partes) == 2 else None
+            if not f: error = "Escribe: <DPI> <fecha DD/MM/AAAA>"
+            else: resultados = buscar_por_dpi_y_fecha(partes[0], f)
+        elif modo == "usuario":
+            if len(partes) != 1: error = "Escribe solo el DPI / código del usuario"
+            else: resultados = buscar_por_usuario(partes[0])
+    except ValueError:
+        error = "El número no es válido."
+    if error:
+        await update.message.reply_text(f"⚠️ {error}\nInténtalo de nuevo o /cancelar:"); return EP_VALOR
+    accion = context.user_data.get("ep_accion", "editar")
+    if usuario["rol"] == "operador2" and accion in ("editar", "eliminar"):
+        resultados = [r for r in resultados if r.get("usuario_codigo") == usuario["dpi_asignado"]]
+    if not resultados:
+        await update.message.reply_text("❌ No se encontró ningún paquete con esos datos. Intenta otro o /cancelar:"); return EP_VALOR
+    if len(resultados) == 1:
+        return await _ep_continuar(update.message, context, resultados[0])
+    resultados = resultados[:40]
+    botones = [[InlineKeyboardButton(resumen_paquete_enrol(r), callback_data=f"epsel_{r['usuario_codigo']}|{r['num_paquete']}")] for r in resultados]
+    botones.append([InlineKeyboardButton("🔙 Cancelar", callback_data="menu_inicio")])
+    await update.message.reply_text(f"Hay {len(resultados)} paquetes que coinciden. ¿Cuál eliges?", reply_markup=InlineKeyboardMarkup(botones))
+    return EP_ELEGIR
+
+async def enrol_sel_elegir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    dpi, num = query.data.replace("epsel_", "").rsplit("|", 1)
+    paquete = buscar_por_dpi_y_numero(dpi, int(num))
+    if not paquete:
+        await query.edit_message_text("❌ Ese paquete ya no existe."); return ConversationHandler.END
+    await query.edit_message_reply_markup(reply_markup=None)
+    return await _ep_continuar(query.message, context, paquete)
+
+EP_AYUDA_CAMPO = {
+    "fecha_del": "Escribe la nueva fecha DEL (DD/MM/AAAA o AAAA-MM-DD):",
+    "fecha_al": "Escribe la nueva fecha AL (DD/MM/AAAA o AAAA-MM-DD):",
+    "columna": "Escribe la nueva columna (A, B, C o D):",
+    "numero_general": "Escribe el nuevo N° General (o 'blanco' para dejarlo vacío):",
+}
+
+async def enrol_sel_campo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    campo = query.data.replace("epcampo_", "")
+    context.user_data["ep_campo"] = campo
+    nombre = dict((c, t) for t, c in CAMPOS_ENROL_BOTONES).get(campo, campo)
+    await query.edit_message_text(f"Modificar: {nombre}\n\n" + EP_AYUDA_CAMPO.get(campo, f"Escribe el nuevo valor de {nombre}:"))
+    return EP_NUEVO
+
+async def enrol_sel_nuevo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
+    if not usuario: return ConversationHandler.END
+    d = context.user_data
+    dpi, num, campo = d.get("ep_dpi"), d.get("ep_num"), d.get("ep_campo")
+    if usuario["rol"] == "operador2" and dpi != usuario["dpi_asignado"]:
+        await update.message.reply_text("🚫 Solo puedes editar paquetes de tu propio DPI."); return ConversationHandler.END
+    ok, msg, nuevo_num = actualizar_paquete_clave(dpi, num, campo, update.message.text)
+    if ok:
+        d["ep_num"] = nuevo_num
+        actual = buscar_por_dpi_y_numero(dpi, nuevo_num)
+        texto = "✅ Campo actualizado."
+        if msg: texto += f"\n{msg}"
+        if actual: texto += f"\n\n{texto_paquete_enrol(actual)}"
+        await update.message.reply_text(texto + "\n\n¿Quieres modificar otro campo?", reply_markup=teclado_campos_enrol())
+    else:
+        await update.message.reply_text(f"❌ {msg}\n\nElige el campo de nuevo:", reply_markup=teclado_campos_enrol())
+    return EP_CAMPO
+
+async def enrol_sel_eliminar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
+    if not usuario: return ConversationHandler.END
+    d = context.user_data
+    dpi, num = d.get("ep_dpi"), d.get("ep_num")
+    btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+    if usuario["rol"] == "operador2" and dpi != usuario["dpi_asignado"]:
+        await query.edit_message_text("🚫 Solo puedes eliminar paquetes de tu propio DPI.", reply_markup=btn_volver); return ConversationHandler.END
+    if dpi is not None and buscar_por_dpi_y_numero(dpi, num) and eliminar_paquete(dpi, num):
+        await query.edit_message_text(f"✅ Paquete N° {num} de {dpi} eliminado.", reply_markup=btn_volver)
+    else:
+        await query.edit_message_text("❌ No se pudo eliminar (¿ya no existe?).", reply_markup=btn_volver)
+    d.clear()
+    return ConversationHandler.END
+
 async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("❌ Cancelado.")
@@ -1458,12 +1777,15 @@ if __name__ == "__main__":
             REG_DPI: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_dpi)],
             REG_DEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_del)],
             REG_AL: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_al)],
-            REG_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_num)],
+            REG_NUM: [CallbackQueryHandler(reg_num_cb, pattern="^rsugnum_"),
+                      MessageHandler(filters.TEXT & ~filters.COMMAND, reg_num)],
+            REG_UBIC: [CallbackQueryHandler(reg_ubic_cb, pattern="^rsugubi_")],
             REG_EST: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_est)],
             REG_FIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_fil)],
             REG_COL: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_col)],
             REG_PIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_pil)],
-            REG_GENERAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_general)],
+            REG_GENERAL: [CallbackQueryHandler(reg_general_cb, pattern="^rsuggen_"),
+                          MessageHandler(filters.TEXT & ~filters.COMMAND, reg_general)],
         },
         fallbacks=[CommandHandler("cancelar", cancelar), CallbackQueryHandler(cancelar_a_menu, pattern="^menu_inicio$")],
         per_message=False,
@@ -1538,12 +1860,27 @@ if __name__ == "__main__":
 
     # 5b. Consultas y ediciones de Enrolamiento con botones
     conv_enrol = ConversationHandler(
-        entry_points=[CallbackQueryHandler(enrol_inicio, pattern="^enrol_(buscar|general|fecha|usuario|etiqueta|eliminar|editar)$")],
+        entry_points=[CallbackQueryHandler(enrol_inicio, pattern="^enrol_(buscar|general|fecha|usuario)$")],
         states={ENROL_ARGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, enrol_recibir)]},
         fallbacks=[CommandHandler("cancelar", cancelar), CallbackQueryHandler(cancelar_a_menu, pattern="^menu_inicio$")],
         per_message=False,
     )
     app.add_handler(conv_enrol)
+
+    conv_enrol_sel = ConversationHandler(
+        entry_points=[CallbackQueryHandler(enrol_sel_inicio, pattern="^enrol_(editar|etiqueta|eliminar)$")],
+        states={
+            EP_MODO: [CallbackQueryHandler(enrol_sel_modo, pattern="^epmodo_")],
+            EP_VALOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, enrol_sel_valor)],
+            EP_ELEGIR: [CallbackQueryHandler(enrol_sel_elegir, pattern="^epsel_")],
+            EP_CAMPO: [CallbackQueryHandler(enrol_sel_campo, pattern="^epcampo_")],
+            EP_NUEVO: [MessageHandler(filters.TEXT & ~filters.COMMAND, enrol_sel_nuevo)],
+            EP_CONFIRMAR: [CallbackQueryHandler(enrol_sel_eliminar, pattern="^epdel_si$")],
+        },
+        fallbacks=[CommandHandler("cancelar", cancelar), CallbackQueryHandler(cancelar_a_menu, pattern="^menu_inicio$")],
+        per_message=False,
+    )
+    app.add_handler(conv_enrol_sel)
     app.add_handler(CallbackQueryHandler(enrol_total, pattern="^enrol_total$"))
     app.add_handler(CallbackQueryHandler(totales_anio, pattern="^accion_totales_anio$"))
 
