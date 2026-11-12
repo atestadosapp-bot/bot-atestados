@@ -219,9 +219,13 @@ def insertar_paquete(dpi, num, f_del, f_al, est, fil, col, pil, general=None):
     client = conectar_db()
     try:
         if general is None or str(general).lower() == "auto":
-            res = client.execute("SELECT MAX(numero_general) FROM paquetes")
-            max_gen = res.rows[0][0] or 0
-            nuevo_gen = max_gen + 1
+            # Un solo INSERT: el siguiente N° general se calcula dentro de la misma sentencia
+            client.execute("""
+                INSERT INTO paquetes (usuario_codigo, num_paquete, fecha_del, fecha_al, estanteria, fila, columna, pila, activo, numero_general)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, (SELECT COALESCE(MAX(numero_general), 0) + 1 FROM paquetes))
+            """, (dpi, num, f_del, f_al, est, fil, col, pil))
+            res = client.execute("SELECT numero_general FROM paquetes WHERE usuario_codigo = ? AND num_paquete = ?", (dpi, num))
+            return (res.rows[0][0] if res.rows else None, None)
         elif str(general).lower() in ("blanco", "null", ""):
             nuevo_gen = None
         else:
@@ -236,7 +240,11 @@ def insertar_paquete(dpi, num, f_del, f_al, est, fil, col, pil, general=None):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         """, (dpi, num, f_del, f_al, est, fil, col, pil, nuevo_gen))
         return (nuevo_gen, None)
-    except Exception as e: return (None, f"Error: {e}")
+    except Exception as e:
+        traceback.print_exc()
+        if "UNIQUE" in str(e).upper():
+            return (None, f"Ya existe el paquete N° {num} para el usuario {dpi}.")
+        return (None, f"Error ({type(e).__name__}): {e}")
 
 def eliminar_paquete(dpi, num):
     client = conectar_db()
@@ -695,7 +703,7 @@ async def etiqueta(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ruta:
             with open(ruta, "rb") as f:
                 caption = f"🏷️ *Etiquetas del Paquete N° {num_real}*\n\n👤 DPI: `{dpi}`\n📅 {res.get('fecha_del')} al {res.get('fecha_al')}\n📍 `{res.get('ubicacion_armada')}`\n\n📄 *Formato:* PDF (listo para imprimir)"
-                await update.message.reply_document(document=f, filename=f"etiqueta_{dpi}_{num_real}.pdf", caption=caption, parse_mode="Markdown")
+                await update.message.reply_document(document=f, filename=f"etiqueta_{dpi}_{num_real}_{datetime.now().strftime('%H%M%S')}.pdf", caption=caption, parse_mode="Markdown")
             os.remove(ruta)
         else: await update.message.reply_text(f"❌ Error al generar PDF: {error}")
     except Exception as e: await update.message.reply_text(f"❌ Error inesperado: {str(e)}")
@@ -1154,7 +1162,7 @@ async def _enviar_etiqueta_evento(mensaje, paquete):
     if not ruta:
         await mensaje.reply_text(f"❌ Error al generar PDF: {error}"); return
     with open(ruta, "rb") as f:
-        await mensaje.reply_document(document=f, filename=f"etiqueta_{paquete['tipo_evento']}_{paquete['anio']}_{paquete['num_paquete']}.pdf",
+        await mensaje.reply_document(document=f, filename=f"etiqueta_{paquete['tipo_evento']}_{paquete['anio']}_{paquete['num_paquete']}_{datetime.now().strftime('%H%M%S')}.pdf",
                                      caption=f"🏷️ Etiqueta: {_resumen_corto(paquete)}\nUbicación: {ubic}")
     os.remove(ruta)
 
