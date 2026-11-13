@@ -1,22 +1,25 @@
 import asyncio
+import contextvars
 import csv
 import io
+import json
 import os
 import shutil
 import sqlite3
 import tempfile
+import time
 import zipfile
 import threading
 import traceback
 import unicodedata
 import libsql_client
 from flask import Flask
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Conflict
 from telegram.ext import (
     Application, CommandHandler, ContextTypes,
-    ConversationHandler, MessageHandler, filters, CallbackQueryHandler
+    ConversationHandler, MessageHandler, filters, CallbackQueryHandler, TypeHandler
 )
 
 # ==========================================
@@ -27,6 +30,14 @@ TURSO_URL = "libsql://atestados-atestadosapp.aws-us-east-1.turso.io"
 TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "PON_AQUI_TU_TOKEN_SI_PRUEBAS_LOCAL")
 
 ADMIN_INICIAL_ID = 6491907692
+
+GT_TZ = timezone(timedelta(hours=-6))  # Guatemala (el servidor de Render trabaja en UTC)
+def ahora_gt():
+    return datetime.now(GT_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+# Usuario del bot que está ejecutando la acción actual (lo fija fijar_actor antes de cada handler)
+ACTOR_ACTUAL = contextvars.ContextVar("actor_actual", default=None)
+_CACHE_ACTOR = {}
 
 # Estados para el ConversationHandler de /registrar (ENROLAMIENTO)
 (REG_DPI, REG_DEL, REG_AL, REG_NUM, REG_EST, REG_FIL, REG_COL, REG_PIL, REG_GENERAL) = range(9)
@@ -39,6 +50,8 @@ ENROL_ARGS = 40  # Estado para las consultas/ediciones de Enrolamiento con boton
 (EV_EDIT_MODO, EV_EDIT_ELEGIR) = range(41, 43)  # Edición de eventos: cómo buscar y cuál elegir
 (EV_EDIT_CONFIRMAR, EV_FILTRO_ARGS) = range(43, 45)  # Confirmar eliminación / filtros de consulta
 REG_UBIC = 45  # Registro de enrolamiento: confirmar ubicación sugerida
+BIT_TEXTO = 52  # Búsqueda en la bitácora
+(LT_MODO, LT_VALOR) = range(53, 55)  # Etiquetas en lote
 (EP_MODO, EP_VALOR, EP_ELEGIR, EP_CAMPO, EP_NUEVO, EP_CONFIRMAR) = range(46, 52)  # Buscar / editar / etiqueta / eliminar (enrolamiento)
 
 # ==========================================
@@ -114,8 +127,49 @@ def inicializar_tabla_telegram():
         client.execute("""
             INSERT INTO usuarios_telegram (telegram_id, nombre, rol, area, dpi_asignado, activo, fecha_registro)
             VALUES (?, ?, ?, ?, ?, 1, ?)
-        """, (ADMIN_INICIAL_ID, "Alex Miranda", "admin", "enrolamiento", None, datetime.now().strftime("%Y-%m-%d %H:%M")))
+        """, (ADMIN_INICIAL_ID, "Alex Miranda", "admin", "enrolamiento", None, ahora_gt()[:16]))
         print(f"✅ Admin inicial registrado: {ADMIN_INICIAL_ID}")
+
+def inicializar_papelera_bitacora():
+    client = conectar_db()
+    client.execute("""
+        CREATE TABLE IF NOT EXISTS papelera (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tabla TEXT NOT NULL,
+            datos TEXT NOT NULL,
+            resumen TEXT,
+            eliminado_por TEXT,
+            fecha TEXT,
+            restaurado INTEGER DEFAULT 0
+        )""")
+    client.execute("""
+        CREATE TABLE IF NOT EXISTS bitacora (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha TEXT,
+            telegram_id INTEGER,
+            usuario TEXT,
+            rol TEXT,
+            accion TEXT,
+            entidad TEXT,
+            detalle TEXT
+        )""")
+
+def bitacora(accion, entidad, detalle):
+    """Registra una acción en la bitácora. Nunca interrumpe la operación si falla."""
+    try:
+        actor = ACTOR_ACTUAL.get() or (None, "desconocido", "")
+        conectar_db().execute(
+            "INSERT INTO bitacora (fecha, telegram_id, usuario, rol, accion, entidad, detalle) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ahora_gt(), actor[0], actor[1], actor[2], accion, entidad, detalle))
+    except Exception as e:
+        print(f"⚠️ No se pudo escribir en la bitácora: {e}")
+
+def mover_a_papelera(tabla, fila, resumen):
+    """Guarda una copia del registro (JSON) en la papelera. Si falla, lanza error y NO se debe borrar."""
+    actor = ACTOR_ACTUAL.get() or (None, "desconocido", "")
+    conectar_db().execute(
+        "INSERT INTO papelera (tabla, datos, resumen, eliminado_por, fecha, restaurado) VALUES (?, ?, ?, ?, ?, 0)",
+        (tabla, json.dumps(fila, ensure_ascii=False), resumen, actor[1], ahora_gt()))
 
 def inicializar_tabla_eventos():
     client = conectar_db()
@@ -165,7 +219,7 @@ def agregar_autorizado(telegram_id, nombre, rol, area, dpi_asignado=None):
         client.execute("""
             INSERT INTO usuarios_telegram (telegram_id, nombre, rol, area, dpi_asignado, activo, fecha_registro)
             VALUES (?, ?, ?, ?, ?, 1, ?)
-        """, (telegram_id, nombre, rol, area, dpi_asignado, datetime.now().strftime("%Y-%m-%d %H:%M")))
+        """, (telegram_id, nombre, rol, area, dpi_asignado, ahora_gt()[:16]))
         return True, None
     except Exception as e:
         return False, str(e)
@@ -223,7 +277,7 @@ def usuario_existe(dpi):
         return res.rows[0][0] > 0
     except: return False
 
-def insertar_paquete(dpi, num, f_del, f_al, est, fil, col, pil, general=None):
+def _insertar_paquete(dpi, num, f_del, f_al, est, fil, col, pil, general=None):
     client = conectar_db()
     try:
         if general is None or str(general).lower() == "auto":
@@ -279,7 +333,7 @@ def paquete_en_ubicacion(est, fil, col, pil, excluir=None):
 
 CAMPOS_ENROL_EDITABLES = ["numero_general", "fecha_del", "fecha_al", "num_paquete", "estanteria", "fila", "columna", "pila"]
 
-def actualizar_paquete_clave(dpi, num, campo, valor):
+def _actualizar_paquete_clave(dpi, num, campo, valor):
     """Actualiza un campo del paquete (dpi + N°). Devuelve (ok, mensaje, num_vigente)."""
     if campo not in CAMPOS_ENROL_EDITABLES: return False, "Campo no editable.", num
     client = conectar_db()
@@ -323,11 +377,22 @@ def actualizar_paquete_clave(dpi, num, campo, valor):
         return False, f"Error ({type(e).__name__}): {e}", num
 
 def eliminar_paquete(dpi, num):
+    """Mueve el paquete a la papelera (copia primero, borra después) y lo registra en la bitácora."""
     client = conectar_db()
-    client.execute("DELETE FROM paquetes WHERE usuario_codigo = ? AND num_paquete = ?", (dpi, num))
-    return True
+    try:
+        filas = _filas_evento("SELECT * FROM paquetes WHERE usuario_codigo = ? AND num_paquete = ?", (dpi, num))
+        if not filas: return False
+        fila = filas[0]
+        mover_a_papelera("paquetes", fila, f"Paquete N° {num} · {dpi}")
+        client.execute("DELETE FROM paquetes WHERE usuario_codigo = ? AND num_paquete = ?", (dpi, num))
+        gen = fila.get("numero_general")
+        bitacora("ELIMINAR", "paquete", f"{dpi} N° {num} · Gen {gen if gen is not None else 'en blanco'} → enviado a papelera")
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
 
-def actualizar_paquete(dpi, num, campo, valor):
+def _actualizar_paquete(dpi, num, campo, valor):
     campos_validos = ["fecha_del", "fecha_al", "estanteria", "fila", "columna", "pila", "numero_general"]
     if campo not in campos_validos: return False
     client = conectar_db()
@@ -366,14 +431,14 @@ def contar_paquetes_de_usuario(dpi):
 # ==========================================
 # FUNCIONES DE BASE DE DATOS (EVENTOS - REGISTRO CIVIL)
 # ==========================================
-def insertar_evento(tipo, anio, num_paq, folio_ini, folio_fin, num_general, est, fil, col, pil, operador):
+def _insertar_evento(tipo, anio, num_paq, folio_ini, folio_fin, num_general, est, fil, col, pil, operador):
     client = conectar_db()
     try:
         num_general_val = None if str(num_general).lower() in ("blanco", "null", "") else int(num_general)
         client.execute("""
             INSERT INTO eventos (tipo_evento, anio, num_paquete, folio_inicio, folio_fin, numero_general, estanteria, fila, columna, pila, registrado_por, fecha_registro)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (tipo, anio, num_paq, folio_ini, folio_fin, num_general_val, est, fil, col, pil, operador, datetime.now().strftime("%Y-%m-%d %H:%M")))
+        """, (tipo, anio, num_paq, folio_ini, folio_fin, num_general_val, est, fil, col, pil, operador, ahora_gt()[:16]))
         return True, None
     except Exception as e:
         return False, str(e)
@@ -423,7 +488,7 @@ def buscar_evento_por_id(id_evento):
         return dict(zip(_nombres_columnas(res), res.rows[0]))
     return None
 
-def actualizar_evento_id(id_evento, campo, valor):
+def _actualizar_evento_id(id_evento, campo, valor):
     """Actualiza un campo del paquete identificado por su id interno. Devuelve (ok, mensaje_error)."""
     if campo not in CAMPOS_EVENTO_EDITABLES:
         return False, "Campo no editable."
@@ -498,8 +563,17 @@ def buscar_eventos_por_ubicacion(est, fil, col, pil):
     return _filas_evento("SELECT * FROM eventos WHERE " + " AND ".join(cond) + " ORDER BY anio, tipo_evento, num_paquete", tuple(args))
 
 def eliminar_evento_id(id_evento):
-    conectar_db().execute("DELETE FROM eventos WHERE id = ?", (id_evento,))
-    return True
+    """Mueve el paquete de evento a la papelera (copia primero, borra después) y lo registra en la bitácora."""
+    try:
+        fila = buscar_evento_por_id(id_evento)
+        if not fila: return False
+        mover_a_papelera("eventos", fila, f"{fila['tipo_evento']} {fila['anio']} · Paq {fila['num_paquete']} ({fila['folio_inicio']}-{fila['folio_fin']})")
+        conectar_db().execute("DELETE FROM eventos WHERE id = ?", (id_evento,))
+        bitacora("ELIMINAR", "evento", f"{fila['tipo_evento']} {fila['anio']} Paq {fila['num_paquete']} ({fila['folio_inicio']}-{fila['folio_fin']}) → enviado a papelera")
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
 
 # ==========================================
 # UTILIDADES
@@ -522,9 +596,8 @@ def formatear_mensaje(datos, encabezado="📦 *Paquete encontrado*"):
     return (f"{encabezado}\n\n📦 N°: *{num}*\n🔢 General: {num_gen_texto}\n👤 Código: `{dpi}`\n📅 Rango: {f_del} al {f_al}\n📍 *Ubicación:* `{ubicacion}`")
 
 # (La función generar_pdf_etiqueta se mantiene igual que en el código anterior)
-def generar_pdf_etiqueta(dpi, fecha_del, fecha_al, num, num_gen, ubicacion):
-    try: from fpdf import FPDF
-    except ImportError: return None, "No tienes 'fpdf2'."
+def _dibujar_etiqueta_enrol(pdf, y_inicio, dpi, fecha_del, fecha_al, num, num_gen, ubicacion):
+    """Dibuja una etiqueta (ancha + angosta) con su borde superior en y_inicio (mm)."""
     def a_formato_mostrar(fecha):
         if not fecha or fecha == "?": return fecha
         try:
@@ -534,78 +607,89 @@ def generar_pdf_etiqueta(dpi, fecha_del, fecha_al, num, num_gen, ubicacion):
         return fecha
     del_mostrar, al_mostrar = a_formato_mostrar(fecha_del), a_formato_mostrar(fecha_al)
     num_str, gral = str(num), str(num_gen) if num_gen is not None else "-"
+    margen_izq, ancho_disponible = 10, 215.9 - 20
+    ancho_ancha, ancho_sep, ancho_angosta = ancho_disponible * 0.62, ancho_disponible * 0.06, ancho_disponible * 0.32
+    x_ancha, x_sep, x_angosta, ancho_alto = margen_izq, margen_izq + ancho_ancha, margen_izq + ancho_ancha + ancho_sep, 70
+    # ETIQUETA ANCHA
+    pdf.set_draw_color(0, 0, 0); pdf.set_line_width(0.8); pdf.rect(x_ancha, y_inicio, ancho_ancha, ancho_alto)
+    pdf.set_fill_color(221, 221, 221); pdf.rect(x_ancha, y_inicio, ancho_ancha, 12, style="F")
+    pdf.set_xy(x_ancha, y_inicio + 2); pdf.set_font("Helvetica", "B", 20); pdf.cell(ancho_ancha, 8, dpi, align="C")
+    pdf.set_line_width(0.8); pdf.line(x_ancha, y_inicio + 12, x_ancha + ancho_ancha, y_inicio + 12)
+    pdf.set_xy(x_ancha + 3, y_inicio + 14); pdf.set_font("Helvetica", "B", 16); pdf.cell(ancho_ancha - 6, 8, f"DEL: {del_mostrar}", align="L")
+    pdf.set_xy(x_ancha + 3, y_inicio + 22); pdf.cell(ancho_ancha - 6, 8, f"AL: {al_mostrar}", align="L")
+    pdf.line(x_ancha, y_inicio + 30, x_ancha + ancho_ancha, y_inicio + 30)
+    pdf.set_xy(x_ancha, y_inicio + 33); pdf.set_font("Helvetica", "B", 38); pdf.cell(ancho_ancha, 18, f"No. {num_str}", align="C")
+    pdf.set_xy(x_ancha + 3, y_inicio + 52); pdf.set_font("Helvetica", "", 9); pdf.set_text_color(85, 85, 85); pdf.cell(ancho_ancha - 6, 5, f"Gral. N° {gral}", align="R")
+    pdf.set_text_color(0, 0, 0); pdf.line(x_ancha, y_inicio + 58, x_ancha + ancho_ancha, y_inicio + 58)
+    pdf.set_xy(x_ancha, y_inicio + 60); pdf.set_font("Helvetica", "", 14); pdf.cell(ancho_ancha, 8, f"Ubicación: {ubicacion}", align="C")
+    # LÍNEA DE CORTE
+    pdf.set_line_width(0.5); y_actual = y_inicio
+    while y_actual < y_inicio + ancho_alto: pdf.line(x_sep + ancho_sep / 2, y_actual, x_sep + ancho_sep / 2, y_actual + 2); y_actual += 4
+    # ETIQUETA ANGOSTA
+    pdf.set_line_width(0.8); pdf.rect(x_angosta, y_inicio, ancho_angosta, ancho_alto)
+    pdf.set_fill_color(221, 221, 221); pdf.rect(x_angosta, y_inicio, ancho_angosta, 10, style="F")
+    pdf.set_xy(x_angosta, y_inicio + 1.5); pdf.set_font("Helvetica", "B", 14); pdf.cell(ancho_angosta, 7, dpi, align="C")
+    pdf.line(x_angosta, y_inicio + 10, x_angosta + ancho_angosta, y_inicio + 10)
+    pdf.set_xy(x_angosta, y_inicio + 12); pdf.set_font("Helvetica", "B", 12); pdf.cell(ancho_angosta, 6, f"DEL: {del_mostrar}", align="C")
+    pdf.set_xy(x_angosta, y_inicio + 18); pdf.cell(ancho_angosta, 6, f"AL: {al_mostrar}", align="C")
+    pdf.line(x_angosta, y_inicio + 25, x_angosta + ancho_angosta, y_inicio + 25)
+    pdf.set_xy(x_angosta, y_inicio + 28); pdf.set_font("Helvetica", "B", 30); pdf.cell(ancho_angosta, 15, f"No. {num_str}", align="C")
+    pdf.set_xy(x_angosta, y_inicio + 45); pdf.set_font("Helvetica", "", 8); pdf.set_text_color(85, 85, 85); pdf.cell(ancho_angosta - 2, 5, f"Gral. {gral}", align="R")
+    pdf.set_text_color(0, 0, 0); pdf.line(x_angosta, y_inicio + 52, x_angosta + ancho_angosta, y_inicio + 52)
+    pdf.set_xy(x_angosta, y_inicio + 54); pdf.set_font("Helvetica", "", 10); pdf.cell(ancho_angosta, 6, f"Ubic: {ubicacion}", align="C")
+
+
+def generar_pdf_etiqueta(dpi, fecha_del, fecha_al, num, num_gen, ubicacion):
+    try: from fpdf import FPDF
+    except ImportError: return None, "No tienes 'fpdf2'."
     try:
         pdf = FPDF(orientation="P", unit="mm", format="Letter"); pdf.add_page(); pdf.set_auto_page_break(auto=False)
-        margen_izq, margen_sup, ancho_disponible = 10, 15, 215.9 - 20
-        ancho_ancha, ancho_sep, ancho_angosta = ancho_disponible * 0.62, ancho_disponible * 0.06, ancho_disponible * 0.32
-        x_ancha, x_sep, x_angosta, y_inicio, ancho_alto = margen_izq, margen_izq + ancho_ancha, margen_izq + ancho_ancha + ancho_sep, margen_sup, 70
-        # ETIQUETA ANCHA
-        pdf.set_draw_color(0, 0, 0); pdf.set_line_width(0.8); pdf.rect(x_ancha, y_inicio, ancho_ancha, ancho_alto)
-        pdf.set_fill_color(221, 221, 221); pdf.rect(x_ancha, y_inicio, ancho_ancha, 12, style="F")
-        pdf.set_xy(x_ancha, y_inicio + 2); pdf.set_font("Helvetica", "B", 20); pdf.cell(ancho_ancha, 8, dpi, align="C")
-        pdf.set_line_width(0.8); pdf.line(x_ancha, y_inicio + 12, x_ancha + ancho_ancha, y_inicio + 12)
-        pdf.set_xy(x_ancha + 3, y_inicio + 14); pdf.set_font("Helvetica", "B", 16); pdf.cell(ancho_ancha - 6, 8, f"DEL: {del_mostrar}", align="L")
-        pdf.set_xy(x_ancha + 3, y_inicio + 22); pdf.cell(ancho_ancha - 6, 8, f"AL: {al_mostrar}", align="L")
-        pdf.line(x_ancha, y_inicio + 30, x_ancha + ancho_ancha, y_inicio + 30)
-        pdf.set_xy(x_ancha, y_inicio + 33); pdf.set_font("Helvetica", "B", 38); pdf.cell(ancho_ancha, 18, f"No. {num_str}", align="C")
-        pdf.set_xy(x_ancha + 3, y_inicio + 52); pdf.set_font("Helvetica", "", 9); pdf.set_text_color(85, 85, 85); pdf.cell(ancho_ancha - 6, 5, f"Gral. N° {gral}", align="R")
-        pdf.set_text_color(0, 0, 0); pdf.line(x_ancha, y_inicio + 58, x_ancha + ancho_ancha, y_inicio + 58)
-        pdf.set_xy(x_ancha, y_inicio + 60); pdf.set_font("Helvetica", "", 14); pdf.cell(ancho_ancha, 8, f"Ubicación: {ubicacion}", align="C")
-        # LÍNEA DE CORTE
-        pdf.set_line_width(0.5); y_actual = y_inicio
-        while y_actual < y_inicio + ancho_alto: pdf.line(x_sep + ancho_sep / 2, y_actual, x_sep + ancho_sep / 2, y_actual + 2); y_actual += 4
-        # ETIQUETA ANGOSTA
-        pdf.set_line_width(0.8); pdf.rect(x_angosta, y_inicio, ancho_angosta, ancho_alto)
-        pdf.set_fill_color(221, 221, 221); pdf.rect(x_angosta, y_inicio, ancho_angosta, 10, style="F")
-        pdf.set_xy(x_angosta, y_inicio + 1.5); pdf.set_font("Helvetica", "B", 14); pdf.cell(ancho_angosta, 7, dpi, align="C")
-        pdf.line(x_angosta, y_inicio + 10, x_angosta + ancho_angosta, y_inicio + 10)
-        pdf.set_xy(x_angosta, y_inicio + 12); pdf.set_font("Helvetica", "B", 12); pdf.cell(ancho_angosta, 6, f"DEL: {del_mostrar}", align="C")
-        pdf.set_xy(x_angosta, y_inicio + 18); pdf.cell(ancho_angosta, 6, f"AL: {al_mostrar}", align="C")
-        pdf.line(x_angosta, y_inicio + 25, x_angosta + ancho_angosta, y_inicio + 25)
-        pdf.set_xy(x_angosta, y_inicio + 28); pdf.set_font("Helvetica", "B", 30); pdf.cell(ancho_angosta, 15, f"No. {num_str}", align="C")
-        pdf.set_xy(x_angosta, y_inicio + 45); pdf.set_font("Helvetica", "", 8); pdf.set_text_color(85, 85, 85); pdf.cell(ancho_angosta - 2, 5, f"Gral. {gral}", align="R")
-        pdf.set_text_color(0, 0, 0); pdf.line(x_angosta, y_inicio + 52, x_angosta + ancho_angosta, y_inicio + 52)
-        pdf.set_xy(x_angosta, y_inicio + 54); pdf.set_font("Helvetica", "", 10); pdf.cell(ancho_angosta, 6, f"Ubic: {ubicacion}", align="C")
+        _dibujar_etiqueta_enrol(pdf, 15, dpi, fecha_del, fecha_al, num, num_gen, ubicacion)
         ruta = os.path.join(tempfile.gettempdir(), f"etiquetas_{dpi}_{num}.pdf"); pdf.output(ruta); return ruta, None
     except Exception as e: return None, str(e)
+
+def _dibujar_etiqueta_evento(pdf, y_inicio, tipo, anio, num, folio_ini, folio_fin, num_gen, ubicacion):
+    """Dibuja una etiqueta de evento (ancha + angosta) con su borde superior en y_inicio (mm)."""
+    num_str, gral = str(num), str(num_gen) if num_gen is not None else "-"
+    encabezado = f"{tipo.upper()} - {anio}"
+    margen_izq, ancho_disponible = 10, 215.9 - 20
+    ancho_ancha, ancho_sep, ancho_angosta = ancho_disponible * 0.62, ancho_disponible * 0.06, ancho_disponible * 0.32
+    x_ancha, x_sep, x_angosta, alto = margen_izq, margen_izq + ancho_ancha, margen_izq + ancho_ancha + ancho_sep, 70
+    # ETIQUETA ANCHA
+    pdf.set_draw_color(0, 0, 0); pdf.set_line_width(0.8); pdf.rect(x_ancha, y_inicio, ancho_ancha, alto)
+    pdf.set_fill_color(221, 221, 221); pdf.rect(x_ancha, y_inicio, ancho_ancha, 12, style="F")
+    pdf.set_xy(x_ancha, y_inicio + 2); pdf.set_font("Helvetica", "B", 20); pdf.cell(ancho_ancha, 8, encabezado, align="C")
+    pdf.line(x_ancha, y_inicio + 12, x_ancha + ancho_ancha, y_inicio + 12)
+    pdf.set_xy(x_ancha + 3, y_inicio + 14); pdf.set_font("Helvetica", "B", 16); pdf.cell(ancho_ancha - 6, 8, f"DEL: {folio_ini}", align="L")
+    pdf.set_xy(x_ancha + 3, y_inicio + 22); pdf.cell(ancho_ancha - 6, 8, f"AL: {folio_fin}", align="L")
+    pdf.line(x_ancha, y_inicio + 30, x_ancha + ancho_ancha, y_inicio + 30)
+    pdf.set_xy(x_ancha, y_inicio + 33); pdf.set_font("Helvetica", "B", 38); pdf.cell(ancho_ancha, 18, f"No. {num_str}", align="C")
+    pdf.set_xy(x_ancha + 3, y_inicio + 52); pdf.set_font("Helvetica", "", 9); pdf.set_text_color(85, 85, 85); pdf.cell(ancho_ancha - 6, 5, f"Gral. N° {gral}", align="R")
+    pdf.set_text_color(0, 0, 0); pdf.line(x_ancha, y_inicio + 58, x_ancha + ancho_ancha, y_inicio + 58)
+    pdf.set_xy(x_ancha, y_inicio + 60); pdf.set_font("Helvetica", "", 14); pdf.cell(ancho_ancha, 8, f"Ubicación: {ubicacion}", align="C")
+    # LÍNEA DE CORTE
+    pdf.set_line_width(0.5); y_actual = y_inicio
+    while y_actual < y_inicio + alto: pdf.line(x_sep + ancho_sep / 2, y_actual, x_sep + ancho_sep / 2, y_actual + 2); y_actual += 4
+    # ETIQUETA ANGOSTA
+    pdf.set_line_width(0.8); pdf.rect(x_angosta, y_inicio, ancho_angosta, alto)
+    pdf.set_fill_color(221, 221, 221); pdf.rect(x_angosta, y_inicio, ancho_angosta, 10, style="F")
+    pdf.set_xy(x_angosta, y_inicio + 1.5); pdf.set_font("Helvetica", "B", 11); pdf.cell(ancho_angosta, 7, encabezado, align="C")
+    pdf.line(x_angosta, y_inicio + 10, x_angosta + ancho_angosta, y_inicio + 10)
+    pdf.set_xy(x_angosta, y_inicio + 12); pdf.set_font("Helvetica", "B", 12); pdf.cell(ancho_angosta, 6, f"DEL: {folio_ini}", align="C")
+    pdf.set_xy(x_angosta, y_inicio + 18); pdf.cell(ancho_angosta, 6, f"AL: {folio_fin}", align="C")
+    pdf.line(x_angosta, y_inicio + 25, x_angosta + ancho_angosta, y_inicio + 25)
+    pdf.set_xy(x_angosta, y_inicio + 28); pdf.set_font("Helvetica", "B", 30); pdf.cell(ancho_angosta, 15, f"No. {num_str}", align="C")
+    pdf.set_xy(x_angosta, y_inicio + 45); pdf.set_font("Helvetica", "", 8); pdf.set_text_color(85, 85, 85); pdf.cell(ancho_angosta - 2, 5, f"Gral. {gral}", align="R")
+    pdf.set_text_color(0, 0, 0); pdf.line(x_angosta, y_inicio + 52, x_angosta + ancho_angosta, y_inicio + 52)
+    pdf.set_xy(x_angosta, y_inicio + 54); pdf.set_font("Helvetica", "", 10); pdf.cell(ancho_angosta, 6, f"Ubic: {ubicacion}", align="C")
+
 
 def generar_pdf_etiqueta_evento(tipo, anio, num, folio_ini, folio_fin, num_gen, ubicacion):
     try: from fpdf import FPDF
     except ImportError: return None, "No tienes 'fpdf2'."
-    num_str, gral = str(num), str(num_gen) if num_gen is not None else "-"
-    encabezado = f"{tipo.upper()} - {anio}"
     try:
         pdf = FPDF(orientation="P", unit="mm", format="Letter"); pdf.add_page(); pdf.set_auto_page_break(auto=False)
-        margen_izq, margen_sup, ancho_disponible = 10, 15, 215.9 - 20
-        ancho_ancha, ancho_sep, ancho_angosta = ancho_disponible * 0.62, ancho_disponible * 0.06, ancho_disponible * 0.32
-        x_ancha, x_sep, x_angosta, y_inicio, alto = margen_izq, margen_izq + ancho_ancha, margen_izq + ancho_ancha + ancho_sep, margen_sup, 70
-        # ETIQUETA ANCHA
-        pdf.set_draw_color(0, 0, 0); pdf.set_line_width(0.8); pdf.rect(x_ancha, y_inicio, ancho_ancha, alto)
-        pdf.set_fill_color(221, 221, 221); pdf.rect(x_ancha, y_inicio, ancho_ancha, 12, style="F")
-        pdf.set_xy(x_ancha, y_inicio + 2); pdf.set_font("Helvetica", "B", 20); pdf.cell(ancho_ancha, 8, encabezado, align="C")
-        pdf.line(x_ancha, y_inicio + 12, x_ancha + ancho_ancha, y_inicio + 12)
-        pdf.set_xy(x_ancha + 3, y_inicio + 14); pdf.set_font("Helvetica", "B", 16); pdf.cell(ancho_ancha - 6, 8, f"DEL: {folio_ini}", align="L")
-        pdf.set_xy(x_ancha + 3, y_inicio + 22); pdf.cell(ancho_ancha - 6, 8, f"AL: {folio_fin}", align="L")
-        pdf.line(x_ancha, y_inicio + 30, x_ancha + ancho_ancha, y_inicio + 30)
-        pdf.set_xy(x_ancha, y_inicio + 33); pdf.set_font("Helvetica", "B", 38); pdf.cell(ancho_ancha, 18, f"No. {num_str}", align="C")
-        pdf.set_xy(x_ancha + 3, y_inicio + 52); pdf.set_font("Helvetica", "", 9); pdf.set_text_color(85, 85, 85); pdf.cell(ancho_ancha - 6, 5, f"Gral. N° {gral}", align="R")
-        pdf.set_text_color(0, 0, 0); pdf.line(x_ancha, y_inicio + 58, x_ancha + ancho_ancha, y_inicio + 58)
-        pdf.set_xy(x_ancha, y_inicio + 60); pdf.set_font("Helvetica", "", 14); pdf.cell(ancho_ancha, 8, f"Ubicación: {ubicacion}", align="C")
-        # LÍNEA DE CORTE
-        pdf.set_line_width(0.5); y_actual = y_inicio
-        while y_actual < y_inicio + alto: pdf.line(x_sep + ancho_sep / 2, y_actual, x_sep + ancho_sep / 2, y_actual + 2); y_actual += 4
-        # ETIQUETA ANGOSTA
-        pdf.set_line_width(0.8); pdf.rect(x_angosta, y_inicio, ancho_angosta, alto)
-        pdf.set_fill_color(221, 221, 221); pdf.rect(x_angosta, y_inicio, ancho_angosta, 10, style="F")
-        pdf.set_xy(x_angosta, y_inicio + 1.5); pdf.set_font("Helvetica", "B", 11); pdf.cell(ancho_angosta, 7, encabezado, align="C")
-        pdf.line(x_angosta, y_inicio + 10, x_angosta + ancho_angosta, y_inicio + 10)
-        pdf.set_xy(x_angosta, y_inicio + 12); pdf.set_font("Helvetica", "B", 12); pdf.cell(ancho_angosta, 6, f"DEL: {folio_ini}", align="C")
-        pdf.set_xy(x_angosta, y_inicio + 18); pdf.cell(ancho_angosta, 6, f"AL: {folio_fin}", align="C")
-        pdf.line(x_angosta, y_inicio + 25, x_angosta + ancho_angosta, y_inicio + 25)
-        pdf.set_xy(x_angosta, y_inicio + 28); pdf.set_font("Helvetica", "B", 30); pdf.cell(ancho_angosta, 15, f"No. {num_str}", align="C")
-        pdf.set_xy(x_angosta, y_inicio + 45); pdf.set_font("Helvetica", "", 8); pdf.set_text_color(85, 85, 85); pdf.cell(ancho_angosta - 2, 5, f"Gral. {gral}", align="R")
-        pdf.set_text_color(0, 0, 0); pdf.line(x_angosta, y_inicio + 52, x_angosta + ancho_angosta, y_inicio + 52)
-        pdf.set_xy(x_angosta, y_inicio + 54); pdf.set_font("Helvetica", "", 10); pdf.cell(ancho_angosta, 6, f"Ubic: {ubicacion}", align="C")
+        _dibujar_etiqueta_evento(pdf, 15, tipo, anio, num, folio_ini, folio_fin, num_gen, ubicacion)
         ruta = os.path.join(tempfile.gettempdir(), f"etiqueta_ev_{tipo}_{anio}_{num}.pdf"); pdf.output(ruta); return ruta, None
     except Exception as e: return None, str(e)
 
@@ -644,6 +728,7 @@ def obtener_menu_principal(usuario):
     if rol in ["admin", "operador1"]: teclado.append([InlineKeyboardButton("👥 GESTIÓN", callback_data="menu_gestion")])
     if rol == "admin": teclado.append([InlineKeyboardButton("🔐 AUTORIZACIÓN", callback_data="menu_autorizacion")])
     if rol == "admin": teclado.append([InlineKeyboardButton("💾 BACKUP BASE DE DATOS", callback_data="accion_backup")])
+    if rol == "admin": teclado.append([InlineKeyboardButton("🗑️ PAPELERA", callback_data="pap_lista"), InlineKeyboardButton("📜 BITÁCORA", callback_data="bit_menu")])
     teclado.append([InlineKeyboardButton("👤 MI INFORMACIÓN", callback_data="menu_info")])
     return InlineKeyboardMarkup(teclado)
     
@@ -683,6 +768,7 @@ async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✏️ Editar paquete", callback_data="enrol_editar")],
             [InlineKeyboardButton("🗑️ Eliminar paquete", callback_data="enrol_eliminar")],
             [InlineKeyboardButton("🏷️ Generar etiqueta PDF", callback_data="enrol_etiqueta")],
+            [InlineKeyboardButton("🏷️ Etiquetas en lote", callback_data="lote_enrol")],
             [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]
         ])
         await query.edit_message_text("✏️ *EDICIÓN DPI*\n\nSelecciona una acción:", reply_markup=btn_en, parse_mode="Markdown")
@@ -704,6 +790,7 @@ async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("➕ Registrar Evento", callback_data="accion_registrar_evento")],
             [InlineKeyboardButton("✏️ Editar Paquete de Evento", callback_data="accion_editar_evento")],
             [InlineKeyboardButton("🏷️ Generar Etiqueta PDF", callback_data="accion_etiqueta_evento")],
+            [InlineKeyboardButton("🏷️ Etiquetas en lote", callback_data="lote_ev")],
             [InlineKeyboardButton("🗑️ Eliminar Paquete de Evento", callback_data="accion_eliminar_evento")],
             [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]
         ])
@@ -1017,7 +1104,8 @@ async def _reg_guardar(update, context, general):
     else:
         gen_texto = str(nuevo_gen) if nuevo_gen is not None else "En blanco"
         ubic = f"E{datos['estanteria']}-F{datos['fila']}-{datos['columna']}-P{datos['pila']}"
-        await _responder(update, f"✅ Registrado\n📦 N°: {datos['num_paquete']}\n🔢 Gen: {gen_texto}\n📍 {ubic}\n👤 {datos['dpi']}", btn_volver)
+        await _responder(update, f"✅ Registrado\n📦 N°: {datos['num_paquete']}\n🔢 Gen: {gen_texto}\n📍 {ubic}\n👤 {datos['dpi']}",
+                         teclado_post_registro_enrol(datos["dpi"], datos["num_paquete"]))
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1042,7 +1130,7 @@ async def registrar_directo(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     general = context.args[8] if len(context.args) == 9 else None
     nuevo_gen, error = insertar_paquete(dpi, num, f_del, f_al, est, fil, col, pil, general)
     if error: await update.message.reply_text(f"❌ {error}")
-    else: await update.message.reply_text(f"✅ Registrado N° {num}")
+    else: await update.message.reply_text(f"✅ Registrado N° {num}", reply_markup=teclado_post_registro_enrol(dpi, num))
     return ConversationHandler.END
 
 async def inicio_registrar_evento(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1195,7 +1283,9 @@ async def flujo_evento_pil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     exito, error = insertar_evento(datos["ev_tipo"], datos["ev_anio"], datos["ev_num"], datos["ev_folio_ini"], datos["ev_folio_fin"], datos["ev_general"], datos["ev_est"], datos["ev_fil"], datos["ev_col"], pil, usuario["dpi_asignado"] or usuario["nombre"])
     if exito:
         gen_txt = f"`{datos['ev_general']}`" if datos['ev_general'].lower() not in ('blanco', 'null', '') else "_blanco_"
-        await update.message.reply_text(f"✅ *Evento Registrado*\n\nTipo: {datos['ev_tipo']}\nAño: {datos['ev_anio']}\nPaquete: {datos['ev_num']}\nGen: {gen_txt}\nEventos: {datos['ev_folio_ini']} al {datos['ev_folio_fin']}\nUbicación: E{datos['ev_est']}-F{datos['ev_fil']}-{datos['ev_col']}-P{pil}", parse_mode="Markdown")
+        coincide = buscar_evento_por_tap(datos["ev_tipo"], datos["ev_anio"], datos["ev_num"])
+        nuevo_id = coincide[0]["id"] if coincide else 0
+        await update.message.reply_text(f"✅ *Evento Registrado*\n\nTipo: {datos['ev_tipo']}\nAño: {datos['ev_anio']}\nPaquete: {datos['ev_num']}\nGen: {gen_txt}\nEventos: {datos['ev_folio_ini']} al {datos['ev_folio_fin']}\nUbicación: E{datos['ev_est']}-F{datos['ev_fil']}-{datos['ev_col']}-P{pil}", parse_mode="Markdown", reply_markup=teclado_post_registro_evento(nuevo_id, datos["ev_tipo"], datos["ev_anio"]))
     else: await update.message.reply_text(f"❌ Error: {error}")
     context.user_data.clear(); return ConversationHandler.END
 
@@ -1696,15 +1786,445 @@ async def backup_bd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(ruta_zip, "rb") as f:
             await mensaje.reply_document(
                 document=f, filename=os.path.basename(ruta_zip),
-                caption=f"💾 Backup completo ({datetime.now().strftime('%d/%m/%Y %H:%M')})\n\n{detalle}\n\n"
+                caption=f"💾 Backup completo ({fecha_corta(ahora_gt())})\n\n{detalle}\n\n"
                         "Incluye la base SQLite (.db) y un CSV por tabla.\n"
                         "⚠️ Contiene datos personales: guárdalo en un lugar seguro y no lo reenvíes.")
+        bitacora("BACKUP", "base de datos", ", ".join(f"{t}: {n}" for t, n in resumen.items()))
         await aviso.edit_text("✅ Backup generado.", reply_markup=btn_volver)
     except Exception as e:
         traceback.print_exc()
         await aviso.edit_text(f"❌ No se pudo generar el backup ({type(e).__name__}): {e}", reply_markup=btn_volver)
     finally:
         if carpeta: shutil.rmtree(carpeta, ignore_errors=True)
+
+# --- Funciones con bitácora (envuelven a las originales) ---
+def insertar_paquete(dpi, num, f_del, f_al, est, fil, col, pil, general=None):
+    nuevo_gen, error = _insertar_paquete(dpi, num, f_del, f_al, est, fil, col, pil, general)
+    if not error:
+        gen = nuevo_gen if nuevo_gen is not None else "en blanco"
+        bitacora("REGISTRAR", "paquete", f"{dpi} N° {num} · Gen {gen} · {fecha_mostrar(f_del)} al {fecha_mostrar(f_al)} · E{est}-F{fil}-{col}-P{pil}")
+    return nuevo_gen, error
+
+def actualizar_paquete_clave(dpi, num, campo, valor):
+    antes = buscar_por_dpi_y_numero(dpi, num)
+    ok, msg, nuevo_num = _actualizar_paquete_clave(dpi, num, campo, valor)
+    if ok:
+        despues = buscar_por_dpi_y_numero(dpi, nuevo_num)
+        bitacora("EDITAR", "paquete", f"{dpi} N° {num}: {campo} {antes.get(campo) if antes else '?'} → {despues.get(campo) if despues else valor}")
+    return ok, msg, nuevo_num
+
+def actualizar_paquete(dpi, num, campo, valor):
+    antes = buscar_por_dpi_y_numero(dpi, num)
+    ok = _actualizar_paquete(dpi, num, campo, valor)
+    if ok:
+        bitacora("EDITAR", "paquete", f"{dpi} N° {num}: {campo} {antes.get(campo) if antes else '?'} → {valor}")
+    return ok
+
+def insertar_evento(tipo, anio, num_paq, folio_ini, folio_fin, num_general, est, fil, col, pil, operador):
+    ok, error = _insertar_evento(tipo, anio, num_paq, folio_ini, folio_fin, num_general, est, fil, col, pil, operador)
+    if ok:
+        bitacora("REGISTRAR", "evento", f"{tipo} {anio} Paq {num_paq} ({folio_ini}-{folio_fin}) · Gen {num_general} · E{est}-F{fil}-{col}-P{pil}")
+    return ok, error
+
+def actualizar_evento_id(id_evento, campo, valor):
+    antes = buscar_evento_por_id(id_evento)
+    ok, error = _actualizar_evento_id(id_evento, campo, valor)
+    if ok:
+        despues = buscar_evento_por_id(id_evento)
+        ref = f"{antes['tipo_evento']} {antes['anio']} Paq {antes['num_paquete']}" if antes else f"id {id_evento}"
+        bitacora("EDITAR", "evento", f"{ref}: {campo} {antes.get(campo) if antes else '?'} → {despues.get(campo) if despues else valor}")
+    return ok, error
+
+# --- Actor: quién ejecuta cada acción ---
+async def fijar_actor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not u: return
+    cache = _CACHE_ACTOR.get(u.id)
+    if cache and time.time() - cache[1] < 120:
+        datos = cache[0]
+    else:
+        usr = usuario_autorizado(u.id)
+        datos = (u.id, usr["nombre"] if usr else u.full_name, usr["rol"] if usr else "sin_acceso")
+        _CACHE_ACTOR[u.id] = (datos, time.time())
+    ACTOR_ACTUAL.set(datos)
+
+def fecha_corta(f):
+    """'2026-11-12 14:30:05' -> '12/11 14:30'"""
+    try:
+        dia, hora = str(f).split(" ")
+        a_, m_, d_ = dia.split("-")
+        return f"{d_}/{m_} {hora[:5]}"
+    except Exception:
+        return str(f)
+
+# --- PAPELERA (solo administradores) ---
+def texto_papelera(tabla, d):
+    gen = d.get("numero_general")
+    gen_txt = gen if gen is not None else "En blanco"
+    if tabla == "paquetes":
+        return (f"📦 Paquete N° {d.get('num_paquete')}\n👤 {d.get('usuario_codigo')}\n🔢 Gen: {gen_txt}\n"
+                f"📅 {fecha_mostrar(d.get('fecha_del'))} al {fecha_mostrar(d.get('fecha_al'))}\n"
+                f"📍 E{d.get('estanteria')}-F{d.get('fila')}-{d.get('columna')}-P{d.get('pila')}")
+    return (f"📖 {d.get('tipo_evento')} {d.get('anio')} · Paquete N° {d.get('num_paquete')}\n"
+            f"Eventos: {d.get('folio_inicio')} al {d.get('folio_fin')}\n🔢 Gen: {gen_txt}\n"
+            f"📍 E{d.get('estanteria')}-F{d.get('fila')}-{d.get('columna')}-P{d.get('pila')}")
+
+def restaurar_de_papelera(id_pap):
+    """Devuelve (ok, mensaje). Reinserta el registro si no choca con otro existente."""
+    client = conectar_db()
+    r = client.execute("SELECT tabla, datos, resumen FROM papelera WHERE id = ? AND restaurado = 0", (id_pap,))
+    if not r.rows: return False, "Ese elemento ya no está en la papelera."
+    tabla, datos_json, resumen = r.rows[0][0], r.rows[0][1], r.rows[0][2]
+    if tabla not in ("paquetes", "eventos"): return False, "Tabla no soportada para restaurar."
+    d = json.loads(datos_json)
+    aviso = ""
+    if tabla == "paquetes":
+        existe = client.execute("SELECT COUNT(*) FROM paquetes WHERE usuario_codigo = ? AND num_paquete = ?", (d.get("usuario_codigo"), d.get("num_paquete")))
+        if existe.rows[0][0] > 0:
+            return False, f"No se puede restaurar: ya existe el paquete N° {d.get('num_paquete')} del usuario {d.get('usuario_codigo')}."
+    else:
+        existe = client.execute("SELECT COUNT(*) FROM eventos WHERE tipo_evento = ? AND anio = ? AND num_paquete = ?", (d.get("tipo_evento"), d.get("anio"), d.get("num_paquete")))
+        if existe.rows[0][0] > 0:
+            return False, f"No se puede restaurar: ya existe el paquete {d.get('num_paquete')} de {d.get('tipo_evento')} {d.get('anio')}."
+    if d.get("numero_general") is not None:
+        en_uso = client.execute(f"SELECT COUNT(*) FROM {tabla} WHERE numero_general = ?", (d["numero_general"],))
+        if en_uso.rows[0][0] > 0:
+            aviso = f"\n⚠️ El N° General {d['numero_general']} ya lo usa otro paquete; se restauró con el N° General en blanco."
+            d["numero_general"] = None
+    columnas_tabla = [c[1] for c in client.execute(f"PRAGMA table_info({tabla})").rows]
+    columnas = [c for c in d.keys() if c in columnas_tabla and c != "id"]
+    marcas = ", ".join("?" for _ in columnas)
+    client.execute(f"INSERT INTO {tabla} ({', '.join(columnas)}) VALUES ({marcas})", tuple(d[c] for c in columnas))
+    client.execute("UPDATE papelera SET restaurado = 1 WHERE id = ?", (id_pap,))
+    bitacora("RESTAURAR", "paquete" if tabla == "paquetes" else "evento", f"{resumen} → restaurado desde la papelera")
+    return True, f"Restaurado: {resumen}{aviso}"
+
+async def papelera_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin"])
+    if not usuario: return
+    query = update.callback_query; await query.answer()
+    accion = query.data
+    client = conectar_db()
+    btn_papelera = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Ver papelera", callback_data="pap_lista")],
+                                         [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+    if accion == "pap_lista":
+        total = client.execute("SELECT COUNT(*) FROM papelera WHERE restaurado = 0").rows[0][0]
+        filas = client.execute("SELECT id, resumen, fecha FROM papelera WHERE restaurado = 0 ORDER BY id DESC LIMIT 15").rows
+        botones = [[InlineKeyboardButton(f"{fecha_corta(f[2])} · {f[1]}"[:60], callback_data=f"pap_ver_{f[0]}")] for f in filas]
+        if filas: botones.append([InlineKeyboardButton("🧹 Vaciar papelera", callback_data="pap_vaciar")])
+        botones.append([InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")])
+        if filas:
+            texto = f"🗑️ PAPELERA ({total} elemento(s))\n\nToca uno para ver el detalle, restaurarlo o eliminarlo definitivamente."
+            if total > 15: texto += "\nSe muestran los 15 más recientes."
+        else:
+            texto = "🗑️ La papelera está vacía."
+        await query.edit_message_text(texto, reply_markup=InlineKeyboardMarkup(botones))
+    elif accion.startswith("pap_ver_"):
+        id_pap = int(accion.replace("pap_ver_", ""))
+        r = client.execute("SELECT tabla, datos, eliminado_por, fecha FROM papelera WHERE id = ? AND restaurado = 0", (id_pap,))
+        if not r.rows:
+            await query.edit_message_text("Ese elemento ya no está en la papelera.", reply_markup=btn_papelera); return
+        tabla, datos_json, quien, cuando = r.rows[0]
+        teclado = InlineKeyboardMarkup([
+            [InlineKeyboardButton("♻️ Restaurar", callback_data=f"pap_rest_{id_pap}")],
+            [InlineKeyboardButton("❌ Eliminar definitivamente", callback_data=f"pap_borr_{id_pap}")],
+            [InlineKeyboardButton("🔙 Volver a la papelera", callback_data="pap_lista")]])
+        await query.edit_message_text(f"{texto_papelera(tabla, json.loads(datos_json))}\n\n🗑️ Eliminado por {quien} el {fecha_corta(cuando)}", reply_markup=teclado)
+    elif accion.startswith("pap_rest_"):
+        try: ok, msg = restaurar_de_papelera(int(accion.replace("pap_rest_", "")))
+        except Exception as e:
+            traceback.print_exc(); ok, msg = False, f"Error ({type(e).__name__}): {e}"
+        await query.edit_message_text(("✅ " if ok else "❌ ") + msg, reply_markup=btn_papelera)
+    elif accion.startswith("pap_borrsi_"):
+        id_pap = int(accion.replace("pap_borrsi_", ""))
+        r = client.execute("SELECT resumen FROM papelera WHERE id = ? AND restaurado = 0", (id_pap,))
+        if r.rows:
+            client.execute("DELETE FROM papelera WHERE id = ?", (id_pap,))
+            bitacora("ELIMINAR DEFINITIVO", "papelera", r.rows[0][0])
+            await query.edit_message_text(f"✅ Eliminado definitivamente: {r.rows[0][0]}", reply_markup=btn_papelera)
+        else:
+            await query.edit_message_text("Ese elemento ya no está en la papelera.", reply_markup=btn_papelera)
+    elif accion.startswith("pap_borr_"):
+        id_pap = int(accion.replace("pap_borr_", ""))
+        teclado = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Sí, eliminar para siempre", callback_data=f"pap_borrsi_{id_pap}")],
+                                        [InlineKeyboardButton("🔙 Cancelar", callback_data=f"pap_ver_{id_pap}")]])
+        await query.edit_message_text("⚠️ Esto elimina el registro definitivamente y ya no se podrá restaurar. ¿Continuar?", reply_markup=teclado)
+    elif accion == "pap_vaciar":
+        teclado = InlineKeyboardMarkup([[InlineKeyboardButton("🧹 Sí, vaciar la papelera", callback_data="pap_vaciarsi")],
+                                        [InlineKeyboardButton("🔙 Cancelar", callback_data="pap_lista")]])
+        await query.edit_message_text("⚠️ Se eliminarán definitivamente TODOS los elementos de la papelera. ¿Continuar?", reply_markup=teclado)
+    elif accion == "pap_vaciarsi":
+        total = client.execute("SELECT COUNT(*) FROM papelera WHERE restaurado = 0").rows[0][0]
+        client.execute("DELETE FROM papelera")
+        bitacora("VACIAR PAPELERA", "papelera", f"{total} elemento(s) eliminados definitivamente")
+        await query.edit_message_text(f"✅ Papelera vaciada ({total} elemento(s)).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]]))
+
+# --- BITÁCORA (solo administradores) ---
+def _linea_bitacora(f):
+    # f = (fecha, usuario, rol, accion, entidad, detalle)
+    return f"🕒 {fecha_corta(f[0])} · {f[1]}\n   {f[3]} {f[4]}: {f[5]}"
+
+def _bloques_texto(titulo, lineas, limite=3800):
+    bloques, actual = [], titulo + "\n\n"
+    for l in lineas:
+        if len(actual) + len(l) + 2 > limite:
+            bloques.append(actual); actual = ""
+        actual += l + "\n\n"
+    bloques.append(actual)
+    return bloques
+
+SQL_ULTIMOS_BITACORA = "SELECT fecha, usuario, rol, accion, entidad, detalle FROM bitacora ORDER BY id DESC LIMIT 15"
+
+async def bitacora_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin"])
+    if not usuario: return
+    query = update.callback_query; await query.answer()
+    btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("📜 Bitácora", callback_data="bit_menu")],
+                                       [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+    if query.data == "bit_menu":
+        teclado = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🕒 Últimos 15 movimientos", callback_data="bit_ultimos")],
+            [InlineKeyboardButton("🔎 Buscar en la bitácora", callback_data="bit_buscar")],
+            [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+        await query.edit_message_text("📜 BITÁCORA\n\nRegistro de quién registró, editó, eliminó o restauró cada paquete.", reply_markup=teclado)
+    elif query.data == "bit_ultimos":
+        filas = conectar_db().execute(SQL_ULTIMOS_BITACORA).rows
+        if not filas:
+            await query.edit_message_text("📜 La bitácora aún no tiene movimientos.", reply_markup=btn_volver); return
+        bloques = _bloques_texto("📜 Últimos movimientos", [_linea_bitacora(f) for f in filas])
+        await query.edit_message_text(bloques[0], reply_markup=btn_volver if len(bloques) == 1 else None)
+        for i, b in enumerate(bloques[1:], start=1):
+            await query.message.reply_text(b, reply_markup=btn_volver if i == len(bloques) - 1 else None)
+
+async def historial_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin"])
+    if not usuario: return
+    filas = conectar_db().execute(SQL_ULTIMOS_BITACORA).rows
+    if not filas:
+        await update.message.reply_text("📜 La bitácora aún no tiene movimientos."); return
+    for b in _bloques_texto("📜 Últimos movimientos", [_linea_bitacora(f) for f in filas]):
+        await update.message.reply_text(b)
+
+async def bitacora_buscar_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin"])
+    if not usuario: return ConversationHandler.END
+    query = update.callback_query; await query.answer()
+    await query.edit_message_text("🔎 Escribe lo que buscas: un DPI, el nombre de un usuario del bot, una acción (EDITAR, ELIMINAR, REGISTRAR, RESTAURAR) o un N°.\n\n(/cancelar para salir)")
+    return BIT_TEXTO
+
+async def bitacora_buscar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    patron = f"%{update.message.text.strip()}%"
+    filas = conectar_db().execute("""SELECT fecha, usuario, rol, accion, entidad, detalle FROM bitacora
+        WHERE usuario LIKE ? OR accion LIKE ? OR entidad LIKE ? OR detalle LIKE ? ORDER BY id DESC LIMIT 25""",
+        (patron, patron, patron, patron)).rows
+    btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("📜 Bitácora", callback_data="bit_menu")],
+                                       [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+    if not filas:
+        await update.message.reply_text("❌ No hay movimientos que coincidan.", reply_markup=btn_volver)
+    else:
+        bloques = _bloques_texto(f"🔎 Resultados ({len(filas)}, los más recientes primero)", [_linea_bitacora(f) for f in filas])
+        for i, b in enumerate(bloques):
+            await update.message.reply_text(b, reply_markup=btn_volver if i == len(bloques) - 1 else None)
+    return ConversationHandler.END
+
+# --- Etiquetas en lote (varias por hoja) ---
+ETQ_POR_HOJA, ETQ_Y_INICIO, ETQ_Y_PASO = 3, 12, 84
+
+def generar_pdf_lote_enrol(paquetes):
+    try: from fpdf import FPDF
+    except ImportError: return None, "No tienes 'fpdf2'."
+    try:
+        pdf = FPDF(orientation="P", unit="mm", format="Letter"); pdf.set_auto_page_break(auto=False)
+        for i, r in enumerate(paquetes):
+            pos = i % ETQ_POR_HOJA
+            if pos == 0: pdf.add_page()
+            ubic = f"E{r['estanteria']}-F{r['fila']}-{r['columna']}-P{r['pila']}"
+            _dibujar_etiqueta_enrol(pdf, ETQ_Y_INICIO + pos * ETQ_Y_PASO, r["usuario_codigo"], r["fecha_del"], r["fecha_al"], r["num_paquete"], r.get("numero_general"), ubic)
+        ruta = os.path.join(tempfile.gettempdir(), f"lote_etiquetas_{int(time.time())}.pdf"); pdf.output(ruta); return ruta, None
+    except Exception as e: return None, str(e)
+
+def generar_pdf_lote_evento(paquetes):
+    try: from fpdf import FPDF
+    except ImportError: return None, "No tienes 'fpdf2'."
+    try:
+        pdf = FPDF(orientation="P", unit="mm", format="Letter"); pdf.set_auto_page_break(auto=False)
+        for i, r in enumerate(paquetes):
+            pos = i % ETQ_POR_HOJA
+            if pos == 0: pdf.add_page()
+            ubic = f"E{r['estanteria']}-F{r['fila']}-{r['columna']}-P{r['pila']}"
+            _dibujar_etiqueta_evento(pdf, ETQ_Y_INICIO + pos * ETQ_Y_PASO, r["tipo_evento"], r["anio"], r["num_paquete"], r["folio_inicio"], r["folio_fin"], r.get("numero_general"), ubic)
+        ruta = os.path.join(tempfile.gettempdir(), f"lote_etiquetas_ev_{int(time.time())}.pdf"); pdf.output(ruta); return ruta, None
+    except Exception as e: return None, str(e)
+
+LOTE_MAX = 90  # 30 hojas
+
+LT_MODOS = {
+    "enrol": [("👤 Por usuario (DPI y rango de paquetes)", "usuario"), ("🔢 Por rango de N° General", "general")],
+    "ev":    [("📦 Por Tipo, Año y rango de paquetes", "paq"), ("🔢 Por rango de N° General", "general")],
+}
+LT_PROMPTS = {
+    ("enrol", "usuario"): "Escribe: <DPI> <desde> <hasta>\nEjemplo: PCOTTON320 15 21",
+    ("enrol", "general"): "Escribe: <desde> <hasta> (N° General)\nEjemplo: 41 60",
+    ("ev", "paq"):        "Escribe: <Tipo> <Año> <desde> <hasta> (N° de paquete)\nEjemplo: Nacimiento 2022 25 30",
+    ("ev", "general"):    "Escribe: <desde> <hasta> (N° General)\nEjemplo: 41 60",
+}
+
+async def lote_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    usuario = await verificar_acceso(update)
+    if not usuario: return ConversationHandler.END
+    area = query.data.replace("lote_", "")  # enrol / ev
+    context.user_data.clear()
+    context.user_data["lt_area"] = area
+    botones = [[InlineKeyboardButton(t, callback_data=f"ltmodo_{m}")] for t, m in LT_MODOS[area]]
+    botones.append([InlineKeyboardButton("🔙 Cancelar", callback_data="menu_inicio")])
+    await query.edit_message_text(f"🏷️ Etiquetas en lote ({'DPI' if area == 'enrol' else 'Eventos'})\n\nSe genera un solo PDF con 3 etiquetas por hoja (máximo {LOTE_MAX}).\n¿Cómo quieres elegir los paquetes?", reply_markup=InlineKeyboardMarkup(botones))
+    return LT_MODO
+
+async def lote_modo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    modo = query.data.replace("ltmodo_", "")
+    context.user_data["lt_modo"] = modo
+    area = context.user_data.get("lt_area", "enrol")
+    await query.edit_message_text(LT_PROMPTS[(area, modo)] + "\n\n(/cancelar para salir)")
+    return LT_VALOR
+
+async def lote_valor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    area, modo = context.user_data.get("lt_area", "enrol"), context.user_data.get("lt_modo")
+    partes = update.message.text.split()
+    try:
+        if (area, modo) == ("enrol", "usuario"):
+            if len(partes) != 3: raise ValueError
+            dpi, desde, hasta = partes[0], int(partes[1]), int(partes[2])
+            filas = _filas_evento("SELECT * FROM paquetes WHERE usuario_codigo = ? AND num_paquete BETWEEN ? AND ? ORDER BY num_paquete", (dpi, desde, hasta))
+            clave, descripcion = "num_paquete", f"{dpi} · paquetes {desde} al {hasta}"
+        elif (area, modo) == ("ev", "paq"):
+            tipo = normalizar_tipo(partes[0]) if len(partes) == 4 else None
+            if not tipo: raise ValueError
+            anio, desde, hasta = int(partes[1]), int(partes[2]), int(partes[3])
+            filas = _filas_evento("SELECT * FROM eventos WHERE tipo_evento = ? AND anio = ? AND num_paquete BETWEEN ? AND ? ORDER BY num_paquete", (tipo, anio, desde, hasta))
+            clave, descripcion = "num_paquete", f"{tipo} {anio} · paquetes {desde} al {hasta}"
+        else:  # rango de N° General
+            if len(partes) != 2: raise ValueError
+            desde, hasta = int(partes[0]), int(partes[1])
+            tabla = "paquetes" if area == "enrol" else "eventos"
+            filas = _filas_evento(f"SELECT * FROM {tabla} WHERE numero_general BETWEEN ? AND ? ORDER BY numero_general", (desde, hasta))
+            clave, descripcion = "numero_general", f"N° General {desde} al {hasta}"
+    except ValueError:
+        await update.message.reply_text("⚠️ Formato inválido.\n" + LT_PROMPTS[(area, modo)] + "\n\nInténtalo de nuevo o /cancelar:")
+        return LT_VALOR
+    if desde > hasta:
+        await update.message.reply_text("⚠️ El número inicial no puede ser mayor que el final. Inténtalo de nuevo o /cancelar:"); return LT_VALOR
+    btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+    if not filas:
+        await update.message.reply_text("❌ No se encontró ningún paquete en ese rango.", reply_markup=btn_volver)
+        context.user_data.clear(); return ConversationHandler.END
+    if len(filas) > LOTE_MAX:
+        await update.message.reply_text(f"⚠️ Son {len(filas)} paquetes; el máximo por lote es {LOTE_MAX}. Reduce el rango e inténtalo de nuevo:"); return LT_VALOR
+    faltan = []
+    if desde <= hasta and hasta - desde <= 500:
+        encontrados = {f[clave] for f in filas if f.get(clave) is not None}
+        faltan = [n for n in range(desde, hasta + 1) if n not in encontrados]
+    aviso = await update.message.reply_text(f"⏳ Generando {len(filas)} etiqueta(s)...")
+    ruta, error = await asyncio.to_thread(generar_pdf_lote_enrol if area == "enrol" else generar_pdf_lote_evento, filas)
+    if not ruta:
+        await aviso.edit_text(f"❌ Error al generar el PDF: {error}", reply_markup=btn_volver)
+        context.user_data.clear(); return ConversationHandler.END
+    caption = f"🏷️ Lote de {len(filas)} etiqueta(s)\n{descripcion}"
+    if faltan: caption += f"\n⚠️ Sin paquete: {', '.join(str(n) for n in faltan[:20])}" + (" …" if len(faltan) > 20 else "")
+    with open(ruta, "rb") as f:
+        await update.message.reply_document(document=f, filename=f"lote_etiquetas_{datetime.now().strftime('%H%M%S')}.pdf", caption=caption)
+    os.remove(ruta)
+    await aviso.edit_text("✅ Lote generado.", reply_markup=btn_volver)
+    bitacora("IMPRIMIR LOTE", "paquete" if area == "enrol" else "evento", f"{len(filas)} etiqueta(s) · {descripcion}")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# --- Flujo rápido: opciones debajo del paquete recién registrado ---
+def teclado_post_registro_enrol(dpi, num):
+    rol = (ACTOR_ACTUAL.get() or (None, "", ""))[2]
+    filas = [[InlineKeyboardButton("✏️ Editar", callback_data=f"pe_ed_{dpi}|{num}"),
+              InlineKeyboardButton("🏷️ Imprimir etiqueta", callback_data=f"pe_pr_{dpi}|{num}")],
+             [InlineKeyboardButton("➕ Registrar otro (mismo usuario)", callback_data=f"pe_otro_{dpi}")]]
+    if rol != "operador2":
+        filas.append([InlineKeyboardButton("👤 Registrar otro (otro usuario)", callback_data="enrol_registrar")])
+    filas.append([InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")])
+    return InlineKeyboardMarkup(filas)
+
+def teclado_post_registro_evento(id_evento, tipo, anio):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Editar", callback_data=f"ev_ed_{id_evento}"),
+         InlineKeyboardButton("🏷️ Imprimir etiqueta", callback_data=f"ev_pr_{id_evento}")],
+        [InlineKeyboardButton(f"➕ Registrar otro ({tipo} {anio})", callback_data=f"ev_otro_{tipo}|{anio}")],
+        [InlineKeyboardButton("🆕 Otro tipo o año", callback_data="accion_registrar_evento")],
+        [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+
+async def post_imprimir_enrol(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update)
+    if not usuario: return
+    query = update.callback_query; await query.answer()
+    dpi, num = query.data.replace("pe_pr_", "").rsplit("|", 1)
+    paquete = buscar_por_dpi_y_numero(dpi, int(num))
+    if not paquete: await query.message.reply_text("❌ Ese paquete ya no existe."); return
+    await _enviar_etiqueta_paquete(query.message, paquete)
+
+async def post_editar_enrol(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
+    if not usuario: return ConversationHandler.END
+    query = update.callback_query; await query.answer()
+    dpi, num = query.data.replace("pe_ed_", "").rsplit("|", 1)
+    if usuario["rol"] == "operador2" and dpi != usuario["dpi_asignado"]:
+        await query.message.reply_text("🚫 Solo puedes editar paquetes de tu propio DPI."); return ConversationHandler.END
+    paquete = buscar_por_dpi_y_numero(dpi, int(num))
+    if not paquete: await query.message.reply_text("❌ Ese paquete ya no existe."); return ConversationHandler.END
+    context.user_data.clear()
+    context.user_data.update({"ep_accion": "editar", "ep_dpi": dpi, "ep_num": int(num)})
+    await query.message.reply_text(f"✏️ Editar paquete:\n{texto_paquete_enrol(paquete)}\n\n¿Qué campo deseas modificar?", reply_markup=teclado_campos_enrol())
+    return EP_CAMPO
+
+async def registrar_otro_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
+    if not usuario: return ConversationHandler.END
+    query = update.callback_query; await query.answer()
+    dpi = query.data.replace("pe_otro_", "")
+    if usuario["rol"] == "operador2" and dpi != usuario["dpi_asignado"]:
+        await query.message.reply_text("🚫 Solo puedes registrar paquetes de tu propio DPI."); return ConversationHandler.END
+    context.user_data.clear()
+    context.user_data["dpi"] = dpi
+    await query.message.reply_text(f"📝 Nuevo paquete\n👤 Usuario: {dpi}\n\n2️⃣ Fecha DEL (AAAA-MM-DD o DD/MM/AAAA):")
+    return REG_DEL
+
+async def post_imprimir_evento(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update)
+    if not usuario: return
+    query = update.callback_query; await query.answer()
+    paquete = buscar_evento_por_id(int(query.data.replace("ev_pr_", "")))
+    if not paquete: await query.message.reply_text("❌ Ese paquete ya no existe."); return
+    await _enviar_etiqueta_evento(query.message, paquete)
+
+async def post_editar_evento(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
+    if not usuario: return ConversationHandler.END
+    query = update.callback_query; await query.answer()
+    paquete = buscar_evento_por_id(int(query.data.replace("ev_ed_", "")))
+    if not paquete: await query.message.reply_text("❌ Ese paquete ya no existe."); return ConversationHandler.END
+    context.user_data.clear()
+    context.user_data.update({"ev_accion": "editar", "edit_id": paquete["id"]})
+    await query.message.reply_text(f"✏️ Editar paquete:\n{texto_evento(paquete)}\n\n¿Qué campo deseas editar?", reply_markup=teclado_campos_evento())
+    return EV_EDIT_CAMPO
+
+async def registrar_evento_otro_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update)
+    if not usuario: return ConversationHandler.END
+    query = update.callback_query; await query.answer()
+    tipo, anio = query.data.replace("ev_otro_", "").rsplit("|", 1)
+    anio = int(anio)
+    context.user_data.clear()
+    context.user_data["ev_tipo"], context.user_data["ev_anio"] = tipo, anio
+    sug = siguiente_num_paquete(tipo, anio)
+    context.user_data["sug_num"] = sug
+    await query.message.reply_text(f"{tipo} {anio}\n\nEl siguiente paquete del año sería el N° {sug}.\n¿Es correcto?", reply_markup=teclado_sugerencia("sugnum", sug))
+    return EV_NUM
 
 async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -1824,12 +2344,23 @@ if __name__ == "__main__":
     print("🤖 Iniciando bot...")
     inicializar_tabla_telegram()
     inicializar_tabla_eventos()
+    inicializar_papelera_bitacora()
     
     app = Application.builder().token(TOKEN).build()
     
+    app.add_handler(TypeHandler(Update, fijar_actor), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("backup", backup_bd))
+    app.add_handler(CommandHandler("historial", historial_cmd))
+    app.add_handler(CallbackQueryHandler(papelera_cb, pattern="^pap_"))
+    app.add_handler(CallbackQueryHandler(bitacora_cb, pattern="^bit_(menu|ultimos)$"))
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(bitacora_buscar_inicio, pattern="^bit_buscar$")],
+        states={BIT_TEXTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, bitacora_buscar_texto)]},
+        fallbacks=[CommandHandler("cancelar", cancelar), CallbackQueryHandler(cancelar_a_menu, pattern="^menu_inicio$")],
+        per_message=False,
+    ))
     app.add_handler(CallbackQueryHandler(backup_bd, pattern="^accion_backup$"))
     app.add_handler(CommandHandler("mi_id", mi_id))
     app.add_handler(CommandHandler("buscar", buscar))
@@ -1848,7 +2379,7 @@ if __name__ == "__main__":
     
     # 1. Flujo de Registro Enrolamiento
     conv_registro = ConversationHandler(
-        entry_points=[CommandHandler("registrar", registrar_inicio), CallbackQueryHandler(registrar_inicio_cb, pattern="^enrol_registrar$")],
+        entry_points=[CommandHandler("registrar", registrar_inicio), CallbackQueryHandler(registrar_inicio_cb, pattern="^enrol_registrar$"), CallbackQueryHandler(registrar_otro_cb, pattern="^pe_otro_")],
         states={
             REG_DPI: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_dpi)],
             REG_DEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_del)],
@@ -1870,7 +2401,7 @@ if __name__ == "__main__":
 
     # 2. Flujo de Registro Eventos
     conv_evento = ConversationHandler(
-        entry_points=[CallbackQueryHandler(inicio_registrar_evento, pattern="^accion_registrar_evento$")],
+        entry_points=[CallbackQueryHandler(inicio_registrar_evento, pattern="^accion_registrar_evento$"), CallbackQueryHandler(registrar_evento_otro_cb, pattern="^ev_otro_")],
         states={
             EV_TIPO: [CallbackQueryHandler(flujo_evento_tipo, pattern="^tipo_")],
             EV_ANIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_anio)],
@@ -1911,7 +2442,7 @@ if __name__ == "__main__":
 
     # 5. Flujo de Edición de Eventos (NUEVO)
     conv_edit_evento = ConversationHandler(
-        entry_points=[CallbackQueryHandler(inicio_editar_evento, pattern="^accion_(editar|etiqueta|eliminar)_evento$")],
+        entry_points=[CallbackQueryHandler(inicio_editar_evento, pattern="^accion_(editar|etiqueta|eliminar)_evento$"), CallbackQueryHandler(post_editar_evento, pattern="^ev_ed_")],
         states={
             EV_EDIT_MODO: [CallbackQueryHandler(flujo_edit_modo, pattern="^edmodo_")],
             EV_EDIT_GENERAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_edit_general)],
@@ -1944,7 +2475,7 @@ if __name__ == "__main__":
     app.add_handler(conv_enrol)
 
     conv_enrol_sel = ConversationHandler(
-        entry_points=[CallbackQueryHandler(enrol_sel_inicio, pattern="^enrol_(editar|etiqueta|eliminar)$")],
+        entry_points=[CallbackQueryHandler(enrol_sel_inicio, pattern="^enrol_(editar|etiqueta|eliminar)$"), CallbackQueryHandler(post_editar_enrol, pattern="^pe_ed_")],
         states={
             EP_MODO: [CallbackQueryHandler(enrol_sel_modo, pattern="^epmodo_")],
             EP_VALOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, enrol_sel_valor)],
@@ -1957,6 +2488,17 @@ if __name__ == "__main__":
         per_message=False,
     )
     app.add_handler(conv_enrol_sel)
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(lote_inicio, pattern="^lote_(enrol|ev)$")],
+        states={
+            LT_MODO: [CallbackQueryHandler(lote_modo, pattern="^ltmodo_")],
+            LT_VALOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, lote_valor)],
+        },
+        fallbacks=[CommandHandler("cancelar", cancelar), CallbackQueryHandler(cancelar_a_menu, pattern="^menu_inicio$")],
+        per_message=False,
+    ))
+    app.add_handler(CallbackQueryHandler(post_imprimir_enrol, pattern="^pe_pr_"))
+    app.add_handler(CallbackQueryHandler(post_imprimir_evento, pattern="^ev_pr_"))
     app.add_handler(CallbackQueryHandler(enrol_total, pattern="^enrol_total$"))
     app.add_handler(CallbackQueryHandler(totales_anio, pattern="^accion_totales_anio$"))
 
