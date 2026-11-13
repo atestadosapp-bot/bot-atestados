@@ -1,5 +1,11 @@
+import asyncio
+import csv
+import io
 import os
+import shutil
+import sqlite3
 import tempfile
+import zipfile
 import threading
 import traceback
 import unicodedata
@@ -637,6 +643,7 @@ def obtener_menu_principal(usuario):
             teclado.extend([[InlineKeyboardButton("📖 CONSULTAS EVENTOS", callback_data="menu_consulta_reg")], [InlineKeyboardButton("✏️ EDICIÓN EVENTOS", callback_data="menu_edicion_reg")]])
     if rol in ["admin", "operador1"]: teclado.append([InlineKeyboardButton("👥 GESTIÓN", callback_data="menu_gestion")])
     if rol == "admin": teclado.append([InlineKeyboardButton("🔐 AUTORIZACIÓN", callback_data="menu_autorizacion")])
+    if rol == "admin": teclado.append([InlineKeyboardButton("💾 BACKUP BASE DE DATOS", callback_data="accion_backup")])
     teclado.append([InlineKeyboardButton("👤 MI INFORMACIÓN", callback_data="menu_info")])
     return InlineKeyboardMarkup(teclado)
     
@@ -1632,6 +1639,73 @@ async def enrol_sel_eliminar(update: Update, context: ContextTypes.DEFAULT_TYPE)
     d.clear()
     return ConversationHandler.END
 
+# --- BACKUP DE LA BASE DE DATOS (solo administradores) ---
+def generar_backup():
+    """Copia TODAS las tablas de Turso a un .zip con: una base SQLite restaurable (.db) y un CSV por tabla.
+    Devuelve (ruta_zip, resumen {tabla: filas}, carpeta_temporal)."""
+    client = conectar_db()
+    sello = datetime.now().strftime("%Y%m%d_%H%M%S")
+    carpeta = tempfile.mkdtemp(prefix="backup_")
+    ruta_db = os.path.join(carpeta, f"atestados_{sello}.db")
+    ruta_zip = os.path.join(carpeta, f"backup_atestados_{sello}.zip")
+    resumen = {}
+    tablas = [(r[0], r[1]) for r in client.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY name").rows]
+    indices = [r[0] for r in client.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%'").rows]
+    local = sqlite3.connect(ruta_db)
+    try:
+        with zipfile.ZipFile(ruta_zip, "w", zipfile.ZIP_DEFLATED) as z:
+            for nombre, sql_crear in tablas:
+                local.execute(sql_crear)
+                res = client.execute(f'SELECT * FROM "{nombre}"')
+                cols = _nombres_columnas(res)
+                filas = [tuple(f) for f in res.rows]
+                if filas:
+                    columnas_sql = ", ".join(f'"{c}"' for c in cols)
+                    marcas = ", ".join("?" for _ in cols)
+                    local.executemany(f'INSERT INTO "{nombre}" ({columnas_sql}) VALUES ({marcas})', filas)
+                resumen[nombre] = len(filas)
+                buf = io.StringIO()
+                escritor = csv.writer(buf)
+                escritor.writerow(cols)
+                escritor.writerows(filas)
+                z.writestr(f"csv/{nombre}.csv", "\ufeff" + buf.getvalue())  # BOM: Excel lee bien los acentos
+            for sql_indice in indices:
+                try: local.execute(sql_indice)
+                except Exception: pass
+            local.commit()
+            local.close()
+            z.write(ruta_db, f"atestados_{sello}.db")
+    finally:
+        try: local.close()
+        except Exception: pass
+    return ruta_zip, resumen, carpeta
+
+async def backup_bd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin"])
+    if not usuario: return
+    if update.callback_query: await update.callback_query.answer()
+    mensaje = update.callback_query.message if update.callback_query else update.message
+    btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+    aviso = await mensaje.reply_text("⏳ Generando backup de la base de datos...")
+    carpeta = None
+    try:
+        ruta_zip, resumen, carpeta = await asyncio.to_thread(generar_backup)
+        detalle = "\n".join(f"• {t}: {n} registro(s)" for t, n in resumen.items())
+        with open(ruta_zip, "rb") as f:
+            await mensaje.reply_document(
+                document=f, filename=os.path.basename(ruta_zip),
+                caption=f"💾 Backup completo ({datetime.now().strftime('%d/%m/%Y %H:%M')})\n\n{detalle}\n\n"
+                        "Incluye la base SQLite (.db) y un CSV por tabla.\n"
+                        "⚠️ Contiene datos personales: guárdalo en un lugar seguro y no lo reenvíes.")
+        await aviso.edit_text("✅ Backup generado.", reply_markup=btn_volver)
+    except Exception as e:
+        traceback.print_exc()
+        await aviso.edit_text(f"❌ No se pudo generar el backup ({type(e).__name__}): {e}", reply_markup=btn_volver)
+    finally:
+        if carpeta: shutil.rmtree(carpeta, ignore_errors=True)
+
 async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("❌ Cancelado.")
@@ -1755,6 +1829,8 @@ if __name__ == "__main__":
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("backup", backup_bd))
+    app.add_handler(CallbackQueryHandler(backup_bd, pattern="^accion_backup$"))
     app.add_handler(CommandHandler("mi_id", mi_id))
     app.add_handler(CommandHandler("buscar", buscar))
     app.add_handler(CommandHandler("etiqueta", etiqueta))
