@@ -52,6 +52,7 @@ ENROL_ARGS = 40  # Estado para las consultas/ediciones de Enrolamiento con boton
 REG_UBIC = 45  # Registro de enrolamiento: confirmar ubicación sugerida
 BIT_TEXTO = 52  # Búsqueda en la bitácora
 (LT_MODO, LT_VALOR) = range(53, 55)  # Etiquetas en lote
+EV_UBIC = 55  # Registro de eventos: confirmar ubicación sugerida
 (EP_MODO, EP_VALOR, EP_ELEGIR, EP_CAMPO, EP_NUEVO, EP_CONFIRMAR) = range(46, 52)  # Buscar / editar / etiqueta / eliminar (enrolamiento)
 
 # ==========================================
@@ -359,7 +360,7 @@ def _actualizar_paquete_clave(dpi, num, campo, valor):
             if v != num and buscar_por_dpi_y_numero(dpi, v): return False, f"Ya existe el paquete N° {v} para este usuario.", num
         elif campo == "columna":
             v = valor.upper()
-            if v not in ("A", "B", "C", "D"): return False, "La columna debe ser A, B, C o D.", num
+            if v not in tuple("ABCDEF"): return False, "La columna debe ser una letra de A a F.", num
         else:
             v = valor
         client.execute(f"UPDATE paquetes SET {campo} = ? WHERE usuario_codigo = ? AND num_paquete = ?", (v, dpi, num))
@@ -1026,19 +1027,27 @@ async def reg_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _reg_pedir_ubicacion(update, context):
     d = context.user_data
+    ref, ref_txt = None, ""
     ult = ultima_ubicacion_usuario(d["dpi"])
-    if not ult:
+    if ult:
+        est, fil, col, pil, num_ult = ult
+        ref = (est, fil, col, pil)
+        ref_txt = f"El último paquete de este usuario (N° {num_ult}) está en E{est}-F{fil}-{col}-P{pil}."
+    else:
+        g = ultima_ubicacion_general()
+        if g:
+            ref = g[:4]
+            ref_txt = f"Este usuario aún no tiene paquetes. El último paquete registrado (N° {g[4]} de {g[5]}) está en E{g[0]}-F{g[1]}-{g[2]}-P{g[3]}."
+    res = sugerir_ubicacion("paquetes", ref, paquete_en_ubicacion) if ref else None
+    if not res:
         await _responder(update, f"Paquete N° {d['num_paquete']}.\n\n5️⃣ Estantería:")
         return REG_EST
-    est, fil, col, pil, num_ult = ult
-    sug_pila = str(int(pil) + 1) if str(pil).isdigit() else str(pil)
-    d["sug_ubic"] = (str(est), str(fil), str(col), sug_pila)
-    ubic = f"E{est}-F{fil}-{col}-P{sug_pila}"
-    texto = f"Paquete N° {d['num_paquete']}.\n\nEl último paquete de este usuario (N° {num_ult}) está en E{est}-F{fil}-{col}-P{pil}.\nUbicación sugerida: {ubic}"
-    ocup = paquete_en_ubicacion(*d["sug_ubic"])
-    if ocup: texto += f"\n⚠️ Esa ubicación ya la ocupa el paquete N° {ocup[1]} de {ocup[0]}."
+    d["sug_ubic"], d["alt5"] = res["sug"], res["alt5"]
+    texto = f"Paquete N° {d['num_paquete']}.\n\n{ref_txt}\nUbicación sugerida: {texto_ubicacion(res['sug'])}"
+    if res["saltos"]: texto += f"\n(Se saltaron {res['saltos']} ubicación(es) ya ocupada(s).)"
     texto += "\n¿Usar esta ubicación?"
-    await _responder(update, texto, teclado_sugerencia("rsugubi", ubic))
+    extra = [InlineKeyboardButton(f"⬆️ Usar nivel {NIVELES_NORMALES + 1} (excepción)", callback_data="rsugubi_n5")] if res["alt5"] else None
+    await _responder(update, texto, teclado_sugerencia("rsugubi", texto_ubicacion(res["sug"]), extra))
     return REG_UBIC
 
 async def _reg_pedir_general(update, context):
@@ -1068,8 +1077,8 @@ async def reg_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reg_ubic_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     d = context.user_data
-    if query.data == "rsugubi_si":
-        d["estanteria"], d["fila"], d["columna"], d["pila"] = d["sug_ubic"]
+    if query.data in ("rsugubi_si", "rsugubi_n5"):
+        d["estanteria"], d["fila"], d["columna"], d["pila"] = d["alt5"] if query.data == "rsugubi_n5" else d["sug_ubic"]
         return await _reg_pedir_general(update, context)
     await query.edit_message_text("5️⃣ Estantería:")
     return REG_EST
@@ -1081,12 +1090,12 @@ async def reg_est(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reg_fil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["fila"] = update.message.text.strip()
-    await update.message.reply_text("7️⃣ Columna (A, B, C, D):")
+    await update.message.reply_text("7️⃣ Columna (A a D; hasta F en las estanterías grandes):")
     return REG_COL
 
 async def reg_col(update: Update, context: ContextTypes.DEFAULT_TYPE):
     col = update.message.text.strip().upper()
-    if col not in ["A", "B", "C", "D"]: await update.message.reply_text("⚠️ Debe ser A, B, C o D:"); return REG_COL
+    if col not in list("ABCDEF"): await update.message.reply_text("⚠️ Debe ser una letra de A a F:"); return REG_COL
     context.user_data["columna"] = col
     await update.message.reply_text("8️⃣ Pila/Nivel:")
     return REG_PIL
@@ -1246,8 +1255,7 @@ async def flujo_evento_general_cb(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("Escribe el Número General (o 'blanco'):")
         return EV_GENERAL
     d["ev_general"] = str(d["sug_gen"]) if query.data == "suggen_si" else "blanco"
-    await query.edit_message_text(f"N° General: {d['ev_general']}\n\nIngresa la Estantería:")
-    return EV_EST
+    return await _ev_pedir_ubicacion(update, context)
 
 async def flujo_evento_general(update: Update, context: ContextTypes.DEFAULT_TYPE):
     general = update.message.text.strip()
@@ -1257,36 +1265,42 @@ async def flujo_evento_general(update: Update, context: ContextTypes.DEFAULT_TYP
         if buscar_evento_por_general(n):
             await update.message.reply_text(f"⚠️ El N° General {n} ya está en uso. Escribe otro (o 'blanco'):"); return EV_GENERAL
     context.user_data["ev_general"] = general
-    await update.message.reply_text("Ingresa la Estantería:")
-    return EV_EST
+    return await _ev_pedir_ubicacion(update, context)
 
 async def flujo_evento_est(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["ev_est"] = update.message.text.strip()
-    await update.message.reply_text("Ingresa la *Fila*:")
+    await update.message.reply_text("Ingresa la Fila:")
     return EV_FIL
 
 async def flujo_evento_fil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["ev_fil"] = update.message.text.strip()
-    await update.message.reply_text("Ingresa la *Columna* (A, B, C, D):")
+    await update.message.reply_text("Ingresa la Columna (A a D; hasta F en las estanterías grandes):")
     return EV_COL
 
 async def flujo_evento_col(update: Update, context: ContextTypes.DEFAULT_TYPE):
     col = update.message.text.strip().upper()
-    if col not in ["A", "B", "C", "D"]: await update.message.reply_text("⚠️ Debe ser A, B, C o D:"); return EV_COL
+    if col not in list("ABCDEF"): await update.message.reply_text("⚠️ Debe ser una letra de A a F:"); return EV_COL
     context.user_data["ev_col"] = col
-    await update.message.reply_text("Ingresa la *Pila/Nivel*:")
+    await update.message.reply_text("Ingresa la Pila/Nivel:")
     return EV_PIL
 
 async def flujo_evento_pil(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pil, datos = update.message.text.strip(), context.user_data
+    context.user_data["ev_pil"] = update.message.text.strip()
+    return await _ev_guardar(update, context)
+
+async def _ev_guardar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    datos = context.user_data
+    mensaje = update.callback_query.message if update.callback_query else update.message
     usuario = await verificar_acceso(update)
+    if not usuario: return ConversationHandler.END
+    pil = datos["ev_pil"]
     exito, error = insertar_evento(datos["ev_tipo"], datos["ev_anio"], datos["ev_num"], datos["ev_folio_ini"], datos["ev_folio_fin"], datos["ev_general"], datos["ev_est"], datos["ev_fil"], datos["ev_col"], pil, usuario["dpi_asignado"] or usuario["nombre"])
     if exito:
         gen_txt = f"`{datos['ev_general']}`" if datos['ev_general'].lower() not in ('blanco', 'null', '') else "_blanco_"
         coincide = buscar_evento_por_tap(datos["ev_tipo"], datos["ev_anio"], datos["ev_num"])
         nuevo_id = coincide[0]["id"] if coincide else 0
-        await update.message.reply_text(f"✅ *Evento Registrado*\n\nTipo: {datos['ev_tipo']}\nAño: {datos['ev_anio']}\nPaquete: {datos['ev_num']}\nGen: {gen_txt}\nEventos: {datos['ev_folio_ini']} al {datos['ev_folio_fin']}\nUbicación: E{datos['ev_est']}-F{datos['ev_fil']}-{datos['ev_col']}-P{pil}", parse_mode="Markdown", reply_markup=teclado_post_registro_evento(nuevo_id, datos["ev_tipo"], datos["ev_anio"]))
-    else: await update.message.reply_text(f"❌ Error: {error}")
+        await mensaje.reply_text(f"✅ *Evento Registrado*\n\nTipo: {datos['ev_tipo']}\nAño: {datos['ev_anio']}\nPaquete: {datos['ev_num']}\nGen: {gen_txt}\nEventos: {datos['ev_folio_ini']} al {datos['ev_folio_fin']}\nUbicación: E{datos['ev_est']}-F{datos['ev_fil']}-{datos['ev_col']}-P{pil}", parse_mode="Markdown", reply_markup=teclado_post_registro_evento(nuevo_id, datos["ev_tipo"], datos["ev_anio"]))
+    else: await mensaje.reply_text(f"❌ Error: {error}")
     context.user_data.clear(); return ConversationHandler.END
 
 # --- BÚSQUEDAS DE EVENTOS ---
@@ -2226,6 +2240,101 @@ async def registrar_evento_otro_cb(update: Update, context: ContextTypes.DEFAULT
     await query.message.reply_text(f"{tipo} {anio}\n\nEl siguiente paquete del año sería el N° {sug}.\n¿Es correcto?", reply_markup=teclado_sugerencia("sugnum", sug))
     return EV_NUM
 
+# --- Reglas físicas de las estanterías y sugerencia de ubicación ---
+NIVELES_NORMALES = 4          # niveles (pilas) por columna; en raras ocasiones caben 5
+COLUMNAS_BASE = "ABCD"        # columnas normales de una estantería
+COLUMNAS_POR_ESTANTERIA = {}  # estanterías con más columnas, ej.: {"7": "ABCDEF"}
+FILA_SIN_TECHO = "0"          # la fila 0 no tiene techo: los niveles no tienen límite
+
+def texto_ubicacion(u):
+    return f"E{u[0]}-F{u[1]}-{u[2]}-P{u[3]}"
+
+def columnas_estanteria(tabla, est):
+    """Columnas disponibles: A-D por defecto; hasta F si la estantería lo tiene configurado o ya usa E/F."""
+    if str(est) in COLUMNAS_POR_ESTANTERIA: return COLUMNAS_POR_ESTANTERIA[str(est)]
+    try:
+        r = conectar_db().execute(f"SELECT MAX(UPPER(columna)) FROM {tabla} WHERE estanteria = ?", (est,))
+        mayor = r.rows[0][0] if r.rows and r.rows[0][0] else "D"
+    except Exception:
+        mayor = "D"
+    if len(str(mayor)) != 1 or str(mayor) not in "DEF": mayor = "D"
+    return "ABCDEF"[: "ABCDEF".index(str(mayor)) + 1]
+
+def siguiente_posicion(est, fila, col, pila, columnas):
+    """Siguiente casilla: sube de nivel; si la columna se llena pasa a la siguiente; si la fila se llena, a la siguiente fila."""
+    if not str(pila).isdigit(): return None
+    n = int(pila)
+    if str(fila) == FILA_SIN_TECHO or n < NIVELES_NORMALES:
+        return (est, fila, col, str(n + 1))
+    if col in columnas and columnas.index(col) + 1 < len(columnas):
+        return (est, fila, columnas[columnas.index(col) + 1], "1")
+    if str(fila).isdigit():
+        return (est, str(int(fila) + 1), columnas[0], "1")
+    return None
+
+def sugerir_ubicacion(tabla, ref, ocupada):
+    """ref = (est, fila, col, pila) del último paquete. Devuelve {'sug', 'alt5', 'saltos'} o None."""
+    est, fila, col, pila = [str(x) for x in ref]
+    columnas = columnas_estanteria(tabla, est)
+    pos, saltos = (est, fila, col, pila), 0
+    for _ in range(80):
+        pos = siguiente_posicion(*pos, columnas)
+        if pos is None: return None
+        if not ocupada(*pos): break
+        saltos += 1
+    else:
+        return None
+    alt5 = None
+    if fila != FILA_SIN_TECHO and pila.isdigit() and int(pila) == NIVELES_NORMALES:
+        candidata = (est, fila, col, str(NIVELES_NORMALES + 1))
+        if not ocupada(*candidata): alt5 = candidata
+    return {"sug": pos, "alt5": alt5, "saltos": saltos}
+
+def ultima_ubicacion_general():
+    """Ubicación del último paquete de enrolamiento registrado (de cualquier usuario)."""
+    r = conectar_db().execute("SELECT estanteria, fila, columna, pila, num_paquete, usuario_codigo FROM paquetes ORDER BY rowid DESC LIMIT 1")
+    return tuple(r.rows[0]) if r.rows else None
+
+def evento_en_ubicacion(est, fil, col, pil):
+    r = conectar_db().execute("SELECT id FROM eventos WHERE estanteria = ? AND fila = ? AND columna = ? AND pila = ? LIMIT 1", (est, fil, col, pil))
+    return bool(r.rows)
+
+def ultima_ubicacion_evento(tipo, anio):
+    """(est, fila, col, pila, texto_referencia) del último paquete del mismo tipo y año; si no hay, el último registrado."""
+    r = conectar_db().execute("SELECT estanteria, fila, columna, pila, num_paquete FROM eventos WHERE tipo_evento = ? AND anio = ? ORDER BY num_paquete DESC LIMIT 1", (tipo, anio))
+    if r.rows:
+        f = r.rows[0]
+        return (f[0], f[1], f[2], f[3], f"El último paquete de {tipo} {anio} (N° {f[4]}) está en E{f[0]}-F{f[1]}-{f[2]}-P{f[3]}.")
+    r = conectar_db().execute("SELECT estanteria, fila, columna, pila, tipo_evento, anio, num_paquete FROM eventos ORDER BY rowid DESC LIMIT 1")
+    if r.rows:
+        f = r.rows[0]
+        return (f[0], f[1], f[2], f[3], f"Aún no hay paquetes de {tipo} {anio}. El último registrado ({f[4]} {f[5]}, N° {f[6]}) está en E{f[0]}-F{f[1]}-{f[2]}-P{f[3]}.")
+    return None
+
+async def _ev_pedir_ubicacion(update, context):
+    d = context.user_data
+    ult = ultima_ubicacion_evento(d["ev_tipo"], d["ev_anio"])
+    res = sugerir_ubicacion("eventos", ult[:4], evento_en_ubicacion) if ult else None
+    if not res:
+        await _responder(update, f"N° General: {d['ev_general']}\n\nIngresa la Estantería:")
+        return EV_EST
+    d["sug_ubic"], d["alt5"] = res["sug"], res["alt5"]
+    texto = f"{ult[4]}\nUbicación sugerida: {texto_ubicacion(res['sug'])}"
+    if res["saltos"]: texto += f"\n(Se saltaron {res['saltos']} ubicación(es) ya ocupada(s).)"
+    texto += "\n¿Usar esta ubicación?"
+    extra = [InlineKeyboardButton(f"⬆️ Usar nivel {NIVELES_NORMALES + 1} (excepción)", callback_data="evsugubi_n5")] if res["alt5"] else None
+    await _responder(update, texto, teclado_sugerencia("evsugubi", texto_ubicacion(res["sug"]), extra))
+    return EV_UBIC
+
+async def ev_ubic_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    d = context.user_data
+    if query.data == "evsugubi_otro":
+        await query.edit_message_text("Ingresa la Estantería:")
+        return EV_EST
+    d["ev_est"], d["ev_fil"], d["ev_col"], d["ev_pil"] = d["alt5"] if query.data == "evsugubi_n5" else d["sug_ubic"]
+    return await _ev_guardar(update, context)
+
 async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("❌ Cancelado.")
@@ -2412,6 +2521,7 @@ if __name__ == "__main__":
             EV_FOLIO_FIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_folio_fin)],
             EV_GENERAL: [CallbackQueryHandler(flujo_evento_general_cb, pattern="^suggen_"),
                          MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_general)],
+            EV_UBIC: [CallbackQueryHandler(ev_ubic_cb, pattern="^evsugubi_")],
             EV_EST: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_est)],
             EV_FIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_fil)],
             EV_COL: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_col)],
