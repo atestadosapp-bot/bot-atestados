@@ -2,3 +2,4 @@ python-telegram-bot
 fpdf2
 Flask
 libsql-client
+Pillow
