@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -13,7 +14,7 @@ import threading
 import traceback
 import unicodedata
 import libsql_client
-from flask import Flask
+from flask import Flask, Response
 from datetime import datetime, timedelta, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Conflict
@@ -53,6 +54,7 @@ REG_UBIC = 45  # Registro de enrolamiento: confirmar ubicación sugerida
 BIT_TEXTO = 52  # Búsqueda en la bitácora
 (LT_MODO, LT_VALOR) = range(53, 55)  # Etiquetas en lote
 EV_UBIC = 55  # Registro de eventos: confirmar ubicación sugerida
+(CG_DATOS, CG_CONFIRMAR) = range(56, 58)  # Carga masiva
 (EP_MODO, EP_VALOR, EP_ELEGIR, EP_CAMPO, EP_NUEVO, EP_CONFIRMAR) = range(46, 52)  # Buscar / editar / etiqueta / eliminar (enrolamiento)
 
 # ==========================================
@@ -727,6 +729,8 @@ def obtener_menu_principal(usuario):
         else:
             teclado.extend([[InlineKeyboardButton("📖 CONSULTAS EVENTOS", callback_data="menu_consulta_reg")], [InlineKeyboardButton("✏️ EDICIÓN EVENTOS", callback_data="menu_edicion_reg")]])
     if rol in ["admin", "operador1"]: teclado.append([InlineKeyboardButton("👥 GESTIÓN", callback_data="menu_gestion")])
+    teclado.append([InlineKeyboardButton("🗄️ MAPA DE ESTANTERÍAS", callback_data="mapa_inicio")])
+    teclado.append([InlineKeyboardButton("📥 CARGA MASIVA (sin internet)", callback_data="accion_cargar")])
     if rol == "admin": teclado.append([InlineKeyboardButton("🔐 AUTORIZACIÓN", callback_data="menu_autorizacion")])
     if rol == "admin": teclado.append([InlineKeyboardButton("💾 BACKUP BASE DE DATOS", callback_data="accion_backup")])
     if rol == "admin": teclado.append([InlineKeyboardButton("🗑️ PAPELERA", callback_data="pap_lista"), InlineKeyboardButton("📜 BITÁCORA", callback_data="bit_menu")])
@@ -2335,6 +2339,360 @@ async def ev_ubic_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d["ev_est"], d["ev_fil"], d["ev_col"], d["ev_pil"] = d["alt5"] if query.data == "evsugubi_n5" else d["sug_ubic"]
     return await _ev_guardar(update, context)
 
+# --- MAPA DE ESTANTERÍAS (imagen con filas, columnas y niveles; libres y ocupados) ---
+FILAS_POR_ESTANTERIA = {}  # opcional: {"5": 6} fuerza hasta qué fila se dibuja (ej.: filas 0 a 6)
+
+def _fuente(tamano, negrita=False):
+    from PIL import ImageFont
+    nombre = "DejaVuSans-Bold.ttf" if negrita else "DejaVuSans.ttf"
+    try: return ImageFont.truetype(nombre, tamano)
+    except Exception: pass
+    try: return ImageFont.load_default(size=tamano)
+    except TypeError: return ImageFont.load_default()
+
+def lista_estanterias():
+    client = conectar_db()
+    vistas = set()
+    for tabla in ("paquetes", "eventos"):
+        for r in client.execute(f"SELECT DISTINCT estanteria FROM {tabla}").rows:
+            if r[0] is not None and str(r[0]).strip() != "": vistas.add(str(r[0]).strip())
+    return sorted(vistas, key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
+
+def datos_estanteria(est):
+    """Devuelve ({(fila, columna, nivel): [(tipo, etiqueta), ...]}, cantidad_sin_ubicar)."""
+    client = conectar_db()
+    ocupados, sin_ubicar = {}, 0
+    consultas = (
+        ("E", "SELECT usuario_codigo, num_paquete, fila, columna, pila FROM paquetes WHERE estanteria = ?"),
+        ("V", "SELECT tipo_evento, anio, num_paquete, fila, columna, pila FROM eventos WHERE estanteria = ?"),
+    )
+    for tipo, sql in consultas:
+        for r in client.execute(sql, (est,)).rows:
+            if tipo == "E":
+                etiqueta = f"{str(r[0])[:7]} #{r[1]}"; fila, col, pila = r[2], r[3], r[4]
+            else:
+                etiqueta = f"{str(r[0])[:3]} {str(r[1])[-2:]} #{r[2]}"; fila, col, pila = r[3], r[4], r[5]
+            fila, col, pila = str(fila).strip(), str(col).strip().upper(), str(pila).strip()
+            if not (fila.isdigit() and pila.isdigit() and len(col) == 1 and col.isalpha()):
+                sin_ubicar += 1; continue
+            ocupados.setdefault((int(fila), col, int(pila)), []).append((tipo, etiqueta))
+    return ocupados, sin_ubicar
+
+def generar_mapa_estanteria(est):
+    """Dibuja la estantería. Devuelve (bytes_png, resumen) o (None, None) si no hay datos."""
+    from PIL import Image, ImageDraw
+    ocupados, sin_ubicar = datos_estanteria(est)
+    if not ocupados: return None, None
+    max_fila = max(f for f, _, _ in ocupados)
+    max_fila = max(max_fila, FILAS_POR_ESTANTERIA.get(str(est), 0))
+    filas = list(range(0, max_fila + 1))
+    usadas = {c for _, c, _ in ocupados}
+    if str(est) in COLUMNAS_POR_ESTANTERIA: columnas = COLUMNAS_POR_ESTANTERIA[str(est)]
+    else:
+        mayor = max(usadas | {"D"})
+        columnas = "ABCDEF"[: "ABCDEF".index(mayor) + 1] if mayor in "ABCDEF" else COLUMNAS_BASE
+        columnas += "".join(sorted(c for c in usadas if c not in columnas))
+    niveles = {}
+    for f in filas:
+        usados = [n for (ff, _, n) in ocupados if ff == f]
+        niveles[f] = max(NIVELES_NORMALES, (max(usados) + 1) if (f == 0 and usados) else (max(usados) if usados else 0))
+    ancho_celda, alto_caja, margen_izq, margen_sup, espacio = 178, 30, 78, 96, 14
+    ancho = margen_izq + len(columnas) * ancho_celda + 20
+    alto = margen_sup + sum(niveles[f] * alto_caja + espacio for f in filas) + 64
+    img = Image.new("RGB", (ancho, alto), "white"); d = ImageDraw.Draw(img)
+    f_tit, f_sub, f_txt, f_peq = _fuente(24, True), _fuente(15), _fuente(14), _fuente(12)
+    colores = {"libre": ((232, 245, 233), (129, 199, 132)), "E": ((187, 222, 251), (21, 101, 192)),
+               "V": ((255, 224, 178), (230, 126, 0)), "conflicto": ((255, 205, 210), (198, 40, 40))}
+    libres = ocup_e = ocup_v = conflictos = 0
+    for i, c in enumerate(columnas):
+        x = margen_izq + i * ancho_celda
+        d.text((x + ancho_celda / 2, margen_sup - 14), f"Columna {c}", font=f_txt, fill=(40, 40, 40), anchor="ms")
+    y = margen_sup
+    for f in filas:
+        n = niveles[f]
+        d.text((margen_izq - 10, y + n * alto_caja / 2), f"Fila {f}", font=f_txt, fill=(40, 40, 40), anchor="rm")
+        if f == 0: d.text((margen_izq - 10, y + n * alto_caja / 2 + 16), "sin techo", font=f_peq, fill=(120, 120, 120), anchor="rm")
+        for i, c in enumerate(columnas):
+            x = margen_izq + i * ancho_celda
+            for nivel in range(1, n + 1):
+                top = y + (n - nivel) * alto_caja
+                registros = ocupados.get((f, c, nivel), [])
+                if not registros:
+                    clave = "libre"
+                    if f > 0 and nivel > NIVELES_NORMALES: texto = f"N{nivel} (extra)"
+                    else: texto = f"N{nivel}"
+                    if f == 0 or nivel <= NIVELES_NORMALES: libres += (0 if f == 0 else 1)
+                elif len(registros) > 1:
+                    clave, texto = "conflicto", f"! {len(registros)} paquetes"; conflictos += 1
+                else:
+                    clave, texto = registros[0][0], registros[0][1]
+                    if clave == "E": ocup_e += 1
+                    else: ocup_v += 1
+                relleno, borde = colores[clave]
+                d.rectangle([x + 3, top + 2, x + ancho_celda - 3, top + alto_caja - 2], fill=relleno, outline=borde, width=2)
+                d.text((x + ancho_celda / 2, top + alto_caja / 2), texto, font=f_txt if clave != "libre" else f_peq,
+                       fill=(30, 30, 30) if clave != "libre" else (90, 140, 95), anchor="mm")
+        y += n * alto_caja + espacio
+    d.text((margen_izq, 14), f"Estantería {est}", font=f_tit, fill=(20, 20, 20))
+    total_ocup = ocup_e + ocup_v + conflictos
+    d.text((margen_izq, 46), f"{total_ocup} nivel(es) ocupado(s) · {libres} libre(s) hasta el nivel {NIVELES_NORMALES} (sin contar la fila 0)", font=f_sub, fill=(70, 70, 70))
+    ly = y + 14
+    for j, (clave, nombre) in enumerate((("libre", "Libre"), ("E", "Enrolamiento"), ("V", "Eventos"), ("conflicto", "Ocupado 2+ veces"))):
+        lx = margen_izq + j * 150
+        relleno, borde = colores[clave]
+        d.rectangle([lx, ly, lx + 18, ly + 18], fill=relleno, outline=borde, width=2)
+        d.text((lx + 26, ly + 9), nombre, font=f_peq, fill=(60, 60, 60), anchor="lm")
+    buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
+    resumen = {"ocupados": total_ocup, "libres": libres, "conflictos": conflictos, "sin_ubicar": sin_ubicar, "enrolamiento": ocup_e, "eventos": ocup_v}
+    return buf, resumen
+
+def teclado_estanterias():
+    est = lista_estanterias()
+    botones, fila_ = [], []
+    for e in est:
+        fila_.append(InlineKeyboardButton(f"E{e}", callback_data=f"mapa_est_{e}"))
+        if len(fila_) == 4: botones.append(fila_); fila_ = []
+    if fila_: botones.append(fila_)
+    botones.append([InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")])
+    return InlineKeyboardMarkup(botones), est
+
+async def _enviar_mapa(mensaje, est):
+    buf, resumen = await asyncio.to_thread(generar_mapa_estanteria, est)
+    btn = InlineKeyboardMarkup([[InlineKeyboardButton("🗄️ Ver otra estantería", callback_data="mapa_inicio")],
+                                [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+    if buf is None:
+        await mensaje.reply_text(f"🗄️ La estantería {est} no tiene paquetes registrados todavía.", reply_markup=btn); return
+    caption = f"🗄️ Estantería {est}: {resumen['ocupados']} ocupado(s) · {resumen['libres']} libre(s) hasta nivel {NIVELES_NORMALES}"
+    if resumen["conflictos"]: caption += f"\n⚠️ {resumen['conflictos']} ubicación(es) con más de un paquete"
+    if resumen["sin_ubicar"]: caption += f"\nℹ️ {resumen['sin_ubicar']} paquete(s) con ubicación incompleta no se dibujan"
+    await mensaje.reply_photo(photo=buf, caption=caption, reply_markup=btn)
+
+async def mapa_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update)
+    if not usuario: return
+    query = update.callback_query; await query.answer()
+    if query.data == "mapa_inicio":
+        teclado, est = teclado_estanterias()
+        texto = "🗄️ MAPA DE ESTANTERÍAS\n\nElige la estantería (también puedes usar /mapa 5):" if est else "🗄️ Aún no hay paquetes con ubicación registrados."
+        await query.edit_message_text(texto, reply_markup=teclado)
+    elif query.data.startswith("mapa_est_"):
+        await _enviar_mapa(query.message, query.data.replace("mapa_est_", ""))
+
+async def mapa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update)
+    if not usuario: return
+    if context.args:
+        await _enviar_mapa(update.message, context.args[0].strip())
+    else:
+        teclado, est = teclado_estanterias()
+        await update.message.reply_text("🗄️ MAPA DE ESTANTERÍAS\n\nElige la estantería:" if est else "🗄️ Aún no hay paquetes con ubicación registrados.", reply_markup=teclado)
+
+# --- CARGA MASIVA: sube los registros guardados sin internet ---
+MAX_LINEAS_CARGA = 300
+
+def url_offline():
+    base = os.environ.get("RENDER_EXTERNAL_URL", "https://bot-atestados.onrender.com").rstrip("/")
+    return base + "/offline/"
+
+def texto_ayuda_carga():
+    return ("📥 CARGA MASIVA\n\n"
+            "Pega aquí los registros que guardaste sin internet, o sube el archivo .txt / .csv. Una línea por paquete:\n\n"
+            "DPI:\nE;usuario;fecha DEL;fecha AL;paquete;estantería;fila;columna;pila;general\n\n"
+            "Eventos:\nV;tipo;año;paquete;DEL;AL;estantería;fila;columna;pila;general\n\n"
+            "• Las fechas pueden ir como AAAA-MM-DD o DD/MM/AAAA.\n"
+            "• El N° General vacío se asigna solo, en orden correlativo.\n"
+            "• Antes de guardar te muestro una revisión y confirmas.\n\n"
+            f"Formulario para registrar sin internet (ábrelo una vez con internet y quedará disponible):\n{url_offline()}\n\n"
+            "(/cancelar para salir)")
+
+def _estado_existente():
+    """Carga de una vez lo que ya existe, para validar sin hacer una consulta por línea."""
+    client = conectar_db()
+    ex = {"paq": set(), "gen_e": set(), "ubic_e": set(), "ev": set(), "gen_v": set(), "ubic_v": set()}
+    def _i(x):
+        try: return int(x)
+        except Exception: return x
+    for r in client.execute("SELECT usuario_codigo, num_paquete, numero_general, estanteria, fila, columna, pila FROM paquetes").rows:
+        ex["paq"].add((str(r[0]).strip().lower(), _i(r[1])))
+        if r[2] is not None: ex["gen_e"].add(_i(r[2]))
+        ex["ubic_e"].add((str(r[3]).strip(), _i(r[4]), str(r[5]).strip().upper(), _i(r[6])))
+    for r in client.execute("SELECT tipo_evento, anio, num_paquete, numero_general, estanteria, fila, columna, pila FROM eventos").rows:
+        ex["ev"].add((str(r[0]), _i(r[1]), _i(r[2])))
+        if r[3] is not None: ex["gen_v"].add(_i(r[3]))
+        ex["ubic_v"].add((str(r[4]).strip(), _i(r[5]), str(r[6]).strip().upper(), _i(r[7])))
+    return ex
+
+def parsear_carga(texto, usuario):
+    """Devuelve (validos, errores, avisos). errores/avisos = [(n° de línea, texto)]."""
+    ex = _estado_existente()
+    validos, errores, avisos = [], [], []
+    vistos = {"paq": set(), "gen_e": set(), "ubic_e": set(), "ev": set(), "gen_v": set(), "ubic_v": set()}
+    for nro, cruda in enumerate(texto.splitlines(), start=1):
+        linea = cruda.strip().lstrip("\ufeff")
+        if not linea or linea.startswith("#"): continue
+        partes = [p.strip() for p in re.split(r"[;|\t]", linea)]
+        if len(partes) == 1: partes = [p.strip() for p in linea.split(",")]
+        t = partes[0].upper()
+        def entero(valor, nombre):
+            if not re.fullmatch(r"\d+", valor or ""): raise ValueError(f"{nombre} debe ser un número")
+            return int(valor)
+        try:
+            if t == "E":
+                if len(partes) < 9: raise ValueError("faltan datos (se esperan 9 o 10 campos)")
+                dpi, f_del, f_al, paq, est, fila, col, pila = partes[1:9]
+                gen_txt = partes[9] if len(partes) > 9 else ""
+                if not dpi: raise ValueError("falta el usuario")
+                if usuario["rol"] == "operador2" and dpi != usuario["dpi_asignado"]:
+                    raise ValueError("solo puedes cargar paquetes de tu propio DPI")
+                f_del, f_al = normalizar_fecha(f_del), normalizar_fecha(f_al)
+                if not f_del or not f_al: raise ValueError("fecha inválida")
+                if f_al < f_del: raise ValueError("la fecha AL es anterior a la fecha DEL")
+                paq, fila, pila = entero(paq, "el paquete"), entero(fila, "la fila"), entero(pila, "la pila")
+                col = col.upper()
+                if col not in tuple("ABCDEF"): raise ValueError("la columna debe ser A-F")
+                if not est: raise ValueError("falta la estantería")
+                if gen_txt.lower() in ("", "auto"): gen = "auto"
+                elif gen_txt.lower() in ("blanco", "null"): gen = None
+                else:
+                    gen = entero(gen_txt, "el N° General")
+                    if gen in ex["gen_e"] or gen in vistos["gen_e"]: raise ValueError(f"el N° General {gen} ya está en uso")
+                    vistos["gen_e"].add(gen)
+                clave = (dpi.lower(), paq)
+                if clave in ex["paq"]: raise ValueError(f"el paquete {paq} de {dpi} ya existe en el sistema")
+                if clave in vistos["paq"]: raise ValueError(f"el paquete {paq} de {dpi} está repetido en el archivo")
+                vistos["paq"].add(clave)
+                ubic = (est, fila, col, pila)
+                if ubic in ex["ubic_e"] or ubic in vistos["ubic_e"]:
+                    avisos.append((nro, f"la ubicación E{est}-F{fila}-{col}-P{pila} ya está ocupada"))
+                vistos["ubic_e"].add(ubic)
+                validos.append({"nro": nro, "tipo": "E", "dpi": dpi, "del": f_del, "al": f_al, "paq": paq, "est": est, "fila": str(fila), "col": col, "pila": str(pila), "gen": gen})
+            elif t == "V":
+                if len(partes) < 10: raise ValueError("faltan datos (se esperan 10 u 11 campos)")
+                tipo_txt, anio, paq, ini, fin, est, fila, col, pila = partes[1:10]
+                gen_txt = partes[10] if len(partes) > 10 else ""
+                tipo = normalizar_tipo(tipo_txt)
+                if not tipo: raise ValueError(f"tipo de evento no reconocido ({tipo_txt})")
+                anio, paq, ini, fin = entero(anio, "el año"), entero(paq, "el paquete"), entero(ini, "el evento DEL"), entero(fin, "el evento AL")
+                if not 2000 <= anio <= 2100: raise ValueError("año fuera de rango")
+                if fin < ini: raise ValueError("el evento AL es menor que el DEL")
+                fila, pila = entero(fila, "la fila"), entero(pila, "la pila")
+                col = col.upper()
+                if col not in tuple("ABCDEF"): raise ValueError("la columna debe ser A-F")
+                if not est: raise ValueError("falta la estantería")
+                if gen_txt.lower() in ("", "auto"): gen = "auto"
+                elif gen_txt.lower() in ("blanco", "null"): gen = None
+                else:
+                    gen = entero(gen_txt, "el N° General")
+                    if gen in ex["gen_v"] or gen in vistos["gen_v"]: raise ValueError(f"el N° General {gen} ya está en uso")
+                    vistos["gen_v"].add(gen)
+                clave = (tipo, anio, paq)
+                if clave in ex["ev"]: raise ValueError(f"el paquete {paq} de {tipo} {anio} ya existe en el sistema")
+                if clave in vistos["ev"]: raise ValueError(f"el paquete {paq} de {tipo} {anio} está repetido en el archivo")
+                vistos["ev"].add(clave)
+                ubic = (est, fila, col, pila)
+                if ubic in ex["ubic_v"] or ubic in vistos["ubic_v"]:
+                    avisos.append((nro, f"la ubicación E{est}-F{fila}-{col}-P{pila} ya está ocupada"))
+                vistos["ubic_v"].add(ubic)
+                validos.append({"nro": nro, "tipo": "V", "evento": tipo, "anio": anio, "paq": paq, "ini": ini, "fin": fin, "est": est, "fila": str(fila), "col": col, "pila": str(pila), "gen": gen})
+            else:
+                raise ValueError("la línea debe empezar con E (DPI) o V (eventos)")
+        except ValueError as e:
+            errores.append((nro, str(e)))
+    return validos, errores, avisos
+
+def ejecutar_carga(validos, usuario):
+    """Inserta cada línea válida. Devuelve (cargados, fallos [(n° de línea, motivo)])."""
+    ok, fallos = 0, []
+    for it in validos:
+        try:
+            if it["tipo"] == "E":
+                general = "auto" if it["gen"] == "auto" else ("blanco" if it["gen"] is None else str(it["gen"]))
+                _, error = insertar_paquete(it["dpi"], it["paq"], it["del"], it["al"], it["est"], it["fila"], it["col"], it["pila"], general)
+            else:
+                if it["gen"] == "auto": general = str(siguiente_general())
+                elif it["gen"] is None: general = "blanco"
+                else: general = str(it["gen"])
+                exito, error = insertar_evento(it["evento"], it["anio"], it["paq"], it["ini"], it["fin"], general, it["est"], it["fila"], it["col"], it["pila"], usuario["dpi_asignado"] or usuario["nombre"])
+                if exito: error = None
+            if error: fallos.append((it["nro"], error))
+            else: ok += 1
+        except Exception as e:
+            traceback.print_exc()
+            fallos.append((it["nro"], f"{type(e).__name__}: {e}"))
+    if ok or fallos:
+        bitacora("CARGA MASIVA", "paquetes", f"{ok} registro(s) cargados, {len(fallos)} con error")
+    return ok, fallos
+
+async def cargar_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
+    if not usuario: return ConversationHandler.END
+    context.user_data.clear()
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(texto_ayuda_carga())
+    else:
+        await update.message.reply_text(texto_ayuda_carga())
+    return CG_DATOS
+
+async def cargar_recibir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
+    if not usuario: return ConversationHandler.END
+    mensaje = update.message
+    if mensaje.document:
+        if mensaje.document.file_size and mensaje.document.file_size > 1_000_000:
+            await mensaje.reply_text("⚠️ El archivo es muy grande (máximo 1 MB). Divídelo e inténtalo de nuevo:"); return CG_DATOS
+        archivo = await mensaje.document.get_file()
+        datos = await archivo.download_as_bytearray()
+        try: texto = bytes(datos).decode("utf-8-sig")
+        except UnicodeDecodeError: texto = bytes(datos).decode("latin-1")
+    else:
+        texto = mensaje.text or ""
+    if len([l for l in texto.splitlines() if l.strip()]) > MAX_LINEAS_CARGA:
+        await mensaje.reply_text(f"⚠️ Máximo {MAX_LINEAS_CARGA} líneas por carga. Divide el archivo e inténtalo de nuevo:"); return CG_DATOS
+    aviso = await mensaje.reply_text("⏳ Revisando los registros...")
+    validos, errores, avisos = await asyncio.to_thread(parsear_carga, texto, usuario)
+    context.user_data["cg_validos"] = validos
+    n_e = sum(1 for v in validos if v["tipo"] == "E"); n_v = len(validos) - n_e
+    lineas = [f"📥 Revisión de la carga\n\n✅ Válidas: {len(validos)} (DPI: {n_e}, Eventos: {n_v})\n❌ Con error: {len(errores)}\n⚠️ Avisos: {len(avisos)}"]
+    if errores:
+        lineas.append("Errores (no se cargarán):\n" + "\n".join(f"• Línea {n}: {m}" for n, m in errores[:15]) + (f"\n… y {len(errores) - 15} más" if len(errores) > 15 else ""))
+    if avisos:
+        lineas.append("Avisos (se cargarán igual):\n" + "\n".join(f"• Línea {n}: {m}" for n, m in avisos[:10]) + (f"\n… y {len(avisos) - 10} más" if len(avisos) > 10 else ""))
+    texto_revision = "\n\n".join(lineas)
+    if validos:
+        teclado = InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Cargar {len(validos)} registro(s)", callback_data="cg_si")],
+                                        [InlineKeyboardButton("🔙 Cancelar", callback_data="menu_inicio")]])
+        texto_revision += "\n\nPuedes enviar un texto corregido para repetir la revisión, o confirmar."
+        estado = CG_CONFIRMAR
+    else:
+        teclado = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancelar", callback_data="menu_inicio")]])
+        texto_revision += "\n\nNo hay líneas válidas. Corrige y vuelve a enviar el texto."
+        estado = CG_DATOS
+    bloques = _bloques_texto("", [texto_revision])
+    await aviso.edit_text(bloques[0].strip(), reply_markup=teclado if len(bloques) == 1 else None)
+    for i, b in enumerate(bloques[1:], start=1):
+        await mensaje.reply_text(b.strip(), reply_markup=teclado if i == len(bloques) - 1 else None)
+    return estado
+
+async def cargar_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
+    if not usuario: return ConversationHandler.END
+    validos = context.user_data.get("cg_validos") or []
+    btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+    if not validos:
+        await query.edit_message_text("No hay registros para cargar.", reply_markup=btn_volver); return ConversationHandler.END
+    await query.edit_message_text(f"⏳ Cargando {len(validos)} registro(s)...")
+    ok, fallos = await asyncio.to_thread(ejecutar_carga, validos, usuario)
+    texto = f"{'✅' if not fallos else '⚠️'} Carga terminada: {ok} de {len(validos)} registro(s) guardados."
+    if fallos:
+        texto += "\n\nNo se guardaron:\n" + "\n".join(f"• Línea {n}: {m}" for n, m in fallos[:15])
+    else:
+        texto += "\n\nYa puedes vaciar la lista en el formulario sin internet."
+    await query.edit_message_text(texto, reply_markup=btn_volver)
+    context.user_data.clear()
+    return ConversationHandler.END
+
 async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("❌ Cancelado.")
@@ -2440,6 +2798,284 @@ app_web = Flask(__name__)
 @app_web.route('/')
 def health_check(): return "Bot is running!"
 
+# --- Formulario para registrar SIN internet (se instala en el celular y funciona sin conexión) ---
+OFFLINE_HTML = r"""<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#1565c0">
+<link rel="manifest" href="/offline/manifest.json">
+<link rel="icon" href="/offline/icon.png">
+<title>Registro sin internet</title>
+<style>
+  :root { --bg:#f4f6fa; --card:#fff; --tx:#1b1f24; --bd:#cfd6df; --az:#1565c0; --gr:#2e7d32; --rj:#c62828; --am:#ef6c00; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#10151b; --card:#1b232c; --tx:#e8ecf1; --bd:#33414f; --az:#64a8ff; --gr:#66bb6a; --rj:#ef6f6c; --am:#ffb74d; } }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:12px 12px 90px; background:var(--bg); color:var(--tx); font:16px/1.4 system-ui, sans-serif; }
+  h1 { font-size:20px; margin:4px 0 8px; }
+  h2 { font-size:17px; margin:20px 0 8px; }
+  #estado { padding:8px 12px; border-radius:8px; font-size:14px; margin-bottom:10px; }
+  .on { background:#e8f5e9; color:#1b5e20; } .off { background:#fff3e0; color:#e65100; }
+  .tabs { display:flex; gap:8px; margin-bottom:10px; }
+  .tabs button { flex:1; padding:10px; border:2px solid var(--az); background:transparent; color:var(--az); border-radius:10px; font-weight:600; font-size:15px; }
+  .tabs button.act { background:var(--az); color:#fff; }
+  .card { background:var(--card); border:1px solid var(--bd); border-radius:12px; padding:12px; margin-bottom:10px; }
+  label { display:block; font-size:13px; margin:8px 0 2px; opacity:.85; }
+  input, select { width:100%; padding:10px; font-size:16px; border:1px solid var(--bd); border-radius:8px; background:var(--bg); color:var(--tx); }
+  .fila2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  button.btn { width:100%; padding:13px; margin-top:10px; border:0; border-radius:10px; font-size:16px; font-weight:600; background:var(--az); color:#fff; }
+  button.sec { background:transparent; color:var(--az); border:2px solid var(--az); }
+  button.pel { background:transparent; color:var(--rj); border:2px solid var(--rj); }
+  .item { display:flex; gap:8px; align-items:center; justify-content:space-between; }
+  .item small { display:block; opacity:.8; }
+  .item button { border:1px solid var(--bd); background:transparent; color:var(--tx); border-radius:8px; padding:8px 10px; font-size:16px; }
+  .aviso { color:var(--am); font-size:13px; }
+  .error { color:var(--rj); font-size:14px; margin-top:8px; min-height:18px; }
+  .ok { color:var(--gr); font-size:14px; }
+  textarea { width:100%; min-height:90px; font:13px monospace; background:var(--bg); color:var(--tx); border:1px solid var(--bd); border-radius:8px; padding:8px; }
+  .nota { font-size:13px; opacity:.8; }
+</style>
+</head>
+<body>
+<h1>📦 Registro sin internet</h1>
+<div id="estado" class="on">Conectado</div>
+
+<div class="tabs">
+  <button id="tabE" class="act">Enrolamiento DPI</button>
+  <button id="tabV">Eventos SIRECI</button>
+</div>
+
+<div class="card">
+  <div id="form"></div>
+  <div id="error" class="error"></div>
+  <button class="btn" id="agregar">➕ Guardar en el celular</button>
+  <button class="btn sec" id="cancelarEdicion" style="display:none">Cancelar edición</button>
+  <p class="nota">Los datos se guardan en este celular. Al tener internet, envíalos al bot con el botón de abajo.</p>
+</div>
+
+<h2>Pendientes de enviar (<span id="n">0</span>)</h2>
+<div id="lista"></div>
+
+<div class="card">
+  <button class="btn" id="compartir">📤 Enviar al bot (compartir)</button>
+  <button class="btn sec" id="copiar">📋 Copiar texto</button>
+  <button class="btn sec" id="descargar">💾 Descargar archivo</button>
+  <div id="msg" class="ok"></div>
+  <p class="nota">En Telegram, abre el bot, usa <b>/cargar</b> y pega el texto (o sube el archivo). Cuando el bot confirme la carga, vuelve aquí y pulsa «Vaciar lista».</p>
+  <button class="btn pel" id="vaciar">🗑️ Vaciar lista (ya enviada)</button>
+</div>
+
+<script>
+/*PURAS*/
+const NIVELES = 4;
+function siguienteUbic(o) {
+  const p = parseInt(o.pila, 10);
+  if (isNaN(p)) return { est: o.est, fila: o.fila, col: o.col, pila: o.pila };
+  if (String(o.fila) === '0' || p < NIVELES) return { est: o.est, fila: o.fila, col: o.col, pila: String(p + 1) };
+  const cols = (o.col === 'E' || o.col === 'F') ? 'ABCDEF' : 'ABCD';
+  const i = cols.indexOf(o.col);
+  if (i >= 0 && i + 1 < cols.length) return { est: o.est, fila: o.fila, col: cols[i + 1], pila: '1' };
+  return { est: o.est, fila: String((parseInt(o.fila, 10) || 0) + 1), col: 'A', pila: '1' };
+}
+function limpio(v) { return String(v === undefined || v === null ? '' : v).replace(/[;\n\r\t|]/g, ' ').trim(); }
+function linea(it) {
+  const d = it.datos;
+  if (it.tipo === 'E') return ['E', d.usuario, d.del, d.al, d.paq, d.est, d.fila, d.col, d.pila, d.gen || ''].map(limpio).join(';');
+  return ['V', d.tipo, d.anio, d.paq, d.ini, d.fin, d.est, d.fila, d.col, d.pila, d.gen || ''].map(limpio).join(';');
+}
+function sugerirSiguiente(tipo, d) {
+  const u = siguienteUbic(d);
+  if (tipo === 'E') return { usuario: d.usuario, paq: String((parseInt(d.paq, 10) || 0) + 1), est: u.est, fila: u.fila, col: u.col, pila: u.pila };
+  return { tipo: d.tipo, anio: d.anio, paq: String((parseInt(d.paq, 10) || 0) + 1), ini: String((parseInt(d.fin, 10) || 0) + 1), est: u.est, fila: u.fila, col: u.col, pila: u.pila };
+}
+function validar(tipo, d) {
+  const entero = (v) => /^\d+$/.test(String(v || '').trim());
+  if (!String(d.est || '').trim()) return 'Falta la estantería.';
+  if (!entero(d.fila)) return 'La fila debe ser un número (0 o más).';
+  if (!/^[A-Fa-f]$/.test(String(d.col || '').trim())) return 'La columna debe ser una letra de A a F.';
+  if (!entero(d.pila) || parseInt(d.pila, 10) < 1) return 'La pila / nivel debe ser un número (1 o más).';
+  if (!entero(d.paq) || parseInt(d.paq, 10) < 1) return 'El N° de paquete debe ser un número.';
+  if (String(d.gen || '').trim() && !entero(d.gen)) return 'El N° General debe ser un número o quedar vacío.';
+  if (tipo === 'E') {
+    if (!String(d.usuario || '').trim()) return 'Falta el usuario (DPI o código).';
+    if (!d.del || !d.al) return 'Faltan las fechas DEL y AL.';
+    if (d.al < d.del) return 'La fecha AL no puede ser anterior a la fecha DEL.';
+  } else {
+    if (!d.tipo) return 'Falta el tipo de evento.';
+    if (!entero(d.anio) || String(d.anio).length !== 4) return 'El año debe tener 4 dígitos.';
+    if (!entero(d.ini) || !entero(d.fin)) return 'Los números de evento DEL y AL deben ser números.';
+    if (parseInt(d.fin, 10) < parseInt(d.ini, 10)) return 'El evento AL no puede ser menor que el DEL.';
+  }
+  return '';
+}
+/*FIN_PURAS*/
+
+const KEY = 'atestados_pendientes_v1';
+const KEY_BOR = 'atestados_borradores_v1';
+const CAMPOS = {
+  E: [
+    { id: 'usuario', et: 'Usuario (DPI o código)', t: 'text' },
+    { id: 'del', et: 'Fecha DEL', t: 'date', mitad: true }, { id: 'al', et: 'Fecha AL', t: 'date', mitad: true },
+    { id: 'paq', et: 'N° de paquete', t: 'number', mitad: true }, { id: 'gen', et: 'N° General (vacío = automático)', t: 'number', mitad: true },
+    { id: 'est', et: 'Estantería', t: 'text', mitad: true }, { id: 'fila', et: 'Fila', t: 'number', mitad: true },
+    { id: 'col', et: 'Columna', t: 'select', op: ['A', 'B', 'C', 'D', 'E', 'F'], mitad: true }, { id: 'pila', et: 'Pila / nivel', t: 'number', mitad: true }
+  ],
+  V: [
+    { id: 'tipo', et: 'Tipo de evento', t: 'select', op: ['Nacimiento', 'Matrimonio', 'Defuncion', 'Divorcio', 'Negativa'] },
+    { id: 'anio', et: 'Año', t: 'number', mitad: true }, { id: 'paq', et: 'N° de paquete', t: 'number', mitad: true },
+    { id: 'ini', et: 'Evento DEL', t: 'number', mitad: true }, { id: 'fin', et: 'Evento AL', t: 'number', mitad: true },
+    { id: 'gen', et: 'N° General (vacío = automático)', t: 'number' },
+    { id: 'est', et: 'Estantería', t: 'text', mitad: true }, { id: 'fila', et: 'Fila', t: 'number', mitad: true },
+    { id: 'col', et: 'Columna', t: 'select', op: ['A', 'B', 'C', 'D', 'E', 'F'], mitad: true }, { id: 'pila', et: 'Pila / nivel', t: 'number', mitad: true }
+  ]
+};
+let tipo = 'E';
+let items = leer(KEY, []);
+let borradores = leer(KEY_BOR, { E: {}, V: {} });
+let editando = null;
+
+function leer(k, def) { try { const v = JSON.parse(localStorage.getItem(k)); return v === null ? def : v; } catch (e) { return def; } }
+function guardar() { try { localStorage.setItem(KEY, JSON.stringify(items)); localStorage.setItem(KEY_BOR, JSON.stringify(borradores)); } catch (e) { mostrarError('No se pudo guardar en el celular (almacenamiento lleno o bloqueado).'); } }
+const $ = (id) => document.getElementById(id);
+function mostrarError(t) { $('error').textContent = t || ''; }
+function msg(t) { $('msg').textContent = t || ''; }
+
+function dibujarForm() {
+  const b = borradores[tipo] || {};
+  let html = '', abierto = false;
+  CAMPOS[tipo].forEach((c) => {
+    if (c.mitad && !abierto) { html += '<div class="fila2">'; abierto = true; }
+    if (!c.mitad && abierto) { html += '</div>'; abierto = false; }
+    const v = b[c.id] !== undefined ? b[c.id] : '';
+    let campo;
+    if (c.t === 'select') campo = '<select id="c_' + c.id + '">' + c.op.map((o) => '<option' + (o === v ? ' selected' : '') + '>' + o + '</option>').join('') + '</select>';
+    else campo = '<input id="c_' + c.id + '" type="' + c.t + '"' + (c.t === 'number' ? ' inputmode="numeric" min="0"' : '') + ' value="' + String(v).replace(/"/g, '&quot;') + '" autocomplete="off">';
+    html += '<div><label for="c_' + c.id + '">' + c.et + '</label>' + campo + '</div>';
+  });
+  if (abierto) html += '</div>';
+  $('form').innerHTML = html;
+}
+function leerForm() {
+  const d = {};
+  CAMPOS[tipo].forEach((c) => { d[c.id] = ($('c_' + c.id).value || '').trim(); });
+  d.col = (d.col || '').toUpperCase();
+  return d;
+}
+function cambiarTab(t) {
+  borradores[tipo] = leerForm();
+  tipo = t; editando = null;
+  $('tabE').classList.toggle('act', t === 'E'); $('tabV').classList.toggle('act', t === 'V');
+  $('cancelarEdicion').style.display = 'none'; $('agregar').textContent = '➕ Guardar en el celular';
+  mostrarError(''); dibujarForm();
+}
+function claveItem(it) { const d = it.datos; return it.tipo === 'E' ? 'E|' + d.usuario.toLowerCase() + '|' + parseInt(d.paq, 10) : 'V|' + d.tipo + '|' + d.anio + '|' + parseInt(d.paq, 10); }
+function claveUbic(it) { const d = it.datos; return [d.est, parseInt(d.fila, 10), d.col.toUpperCase(), parseInt(d.pila, 10)].join('|'); }
+function dibujarLista() {
+  $('n').textContent = items.length;
+  const claves = {}, ubics = {};
+  items.forEach((it) => { claves[claveItem(it)] = (claves[claveItem(it)] || 0) + 1; ubics[claveUbic(it)] = (ubics[claveUbic(it)] || 0) + 1; });
+  $('lista').innerHTML = items.length ? '' : '<p class="nota">Aún no hay registros pendientes.</p>';
+  items.forEach((it, i) => {
+    const d = it.datos, av = [];
+    if (claves[claveItem(it)] > 1) av.push('⚠️ Paquete repetido en la lista');
+    if (ubics[claveUbic(it)] > 1) av.push('⚠️ Misma ubicación que otro pendiente');
+    const titulo = it.tipo === 'E' ? '👤 ' + d.usuario + ' · Paq ' + d.paq : '📖 ' + d.tipo + ' ' + d.anio + ' · Paq ' + d.paq;
+    const detalle = it.tipo === 'E' ? d.del + ' → ' + d.al : 'Eventos ' + d.ini + '-' + d.fin;
+    const div = document.createElement('div'); div.className = 'card item';
+    div.innerHTML = '<div><b>' + titulo + '</b><small>' + detalle + ' · E' + d.est + '-F' + d.fila + '-' + d.col + '-P' + d.pila + (d.gen ? ' · Gen ' + d.gen : '') + '</small>' + av.map((a) => '<span class="aviso">' + a + '</span>').join('<br>') + '</div><div><button data-e="' + i + '">✏️</button> <button data-b="' + i + '">🗑️</button></div>';
+    $('lista').appendChild(div);
+  });
+}
+function agregar() {
+  const d = leerForm(), err = validar(tipo, d);
+  if (err) { mostrarError(err); return; }
+  mostrarError(''); msg('');
+  if (editando !== null) { items[editando] = { tipo, datos: d, ts: items[editando].ts }; editando = null; }
+  else items.push({ tipo, datos: d, ts: Date.now() });
+  borradores[tipo] = sugerirSiguiente(tipo, d);
+  guardar(); $('cancelarEdicion').style.display = 'none'; $('agregar').textContent = '➕ Guardar en el celular';
+  dibujarForm(); dibujarLista(); window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+function textoExport() { return items.map(linea).join('\n'); }
+async function copiar() {
+  const t = textoExport(); if (!t) { msg('No hay registros pendientes.'); return; }
+  try { await navigator.clipboard.writeText(t); msg('✅ Copiado. Pégalo en el bot con /cargar.'); }
+  catch (e) { const ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); msg('✅ Copiado. Pégalo en el bot con /cargar.'); } catch (e2) { msg('No se pudo copiar; usa «Descargar archivo».'); } ta.remove(); }
+}
+async function compartir() {
+  const t = textoExport(); if (!t) { msg('No hay registros pendientes.'); return; }
+  if (navigator.share) { try { await navigator.share({ text: t }); msg('Si lo enviaste al bot, usa /cargar y pega el mensaje.'); return; } catch (e) { if (e && e.name === 'AbortError') return; } }
+  copiar();
+}
+function descargar() {
+  const t = textoExport(); if (!t) { msg('No hay registros pendientes.'); return; }
+  const f = new Date(), p = (n) => String(n).padStart(2, '0');
+  const nombre = 'pendientes_' + f.getFullYear() + p(f.getMonth() + 1) + p(f.getDate()) + '_' + p(f.getHours()) + p(f.getMinutes()) + '.txt';
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([t], { type: 'text/plain' })); a.download = nombre; document.body.appendChild(a); a.click(); a.remove();
+  msg('✅ Archivo descargado. Súbelo al bot después de /cargar.');
+}
+function vaciar() {
+  if (!items.length) return;
+  if (confirm('¿Vaciar la lista? Hazlo solo si el bot ya confirmó la carga.')) { items = []; guardar(); dibujarLista(); msg(''); }
+}
+function estadoRed() { const on = navigator.onLine; const e = $('estado'); e.className = on ? 'on' : 'off'; e.textContent = on ? 'Conectado: ya puedes enviar los pendientes al bot' : 'Sin internet: guarda aquí los registros y envíalos después'; }
+
+$('tabE').onclick = () => cambiarTab('E'); $('tabV').onclick = () => cambiarTab('V');
+$('agregar').onclick = agregar; $('copiar').onclick = copiar; $('compartir').onclick = compartir; $('descargar').onclick = descargar; $('vaciar').onclick = vaciar;
+$('cancelarEdicion').onclick = () => { editando = null; $('cancelarEdicion').style.display = 'none'; $('agregar').textContent = '➕ Guardar en el celular'; mostrarError(''); dibujarForm(); };
+$('lista').onclick = (ev) => {
+  const be = ev.target.getAttribute('data-e'), bb = ev.target.getAttribute('data-b');
+  if (be !== null) { const it = items[+be]; if (it.tipo !== tipo) cambiarTab(it.tipo); borradores[tipo] = Object.assign({}, it.datos); editando = +be; dibujarForm(); $('cancelarEdicion').style.display = 'block'; $('agregar').textContent = '💾 Guardar cambios'; window.scrollTo({ top: 0, behavior: 'smooth' }); }
+  if (bb !== null && confirm('¿Eliminar este registro pendiente?')) { items.splice(+bb, 1); guardar(); dibujarLista(); }
+};
+window.addEventListener('online', estadoRed); window.addEventListener('offline', estadoRed);
+estadoRed(); dibujarForm(); dibujarLista();
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/offline/sw.js', { scope: '/offline/' }).catch(function () {});
+</script>
+</body>
+</html>
+"""
+
+OFFLINE_SW = """
+const C = 'atestados-offline-v1';
+const ARCHIVOS = ['/offline/', '/offline/manifest.json', '/offline/icon.png'];
+self.addEventListener('install', function (e) { e.waitUntil(caches.open(C).then(function (c) { return c.addAll(ARCHIVOS); }).then(function () { return self.skipWaiting(); })); });
+self.addEventListener('activate', function (e) { e.waitUntil(caches.keys().then(function (ks) { return Promise.all(ks.filter(function (k) { return k !== C; }).map(function (k) { return caches.delete(k); })); }).then(function () { return self.clients.claim(); })); });
+self.addEventListener('fetch', function (e) {
+  if (e.request.method !== 'GET') return;
+  e.respondWith(fetch(e.request).then(function (r) { var cp = r.clone(); caches.open(C).then(function (c) { c.put(e.request, cp); }); return r; })
+    .catch(function () { return caches.match(e.request).then(function (r) { return r || caches.match('/offline/'); }); }));
+});
+"""
+
+@app_web.route('/offline')
+@app_web.route('/offline/')
+def offline_pagina():
+    r = Response(OFFLINE_HTML, mimetype="text/html"); r.headers["Cache-Control"] = "no-cache"; return r
+
+@app_web.route('/offline/manifest.json')
+def offline_manifest():
+    datos = {"name": "Registro sin internet - Atestados", "short_name": "Atestados", "start_url": "/offline/", "scope": "/offline/",
+             "display": "standalone", "background_color": "#f4f6fa", "theme_color": "#1565c0",
+             "icons": [{"src": "/offline/icon.png", "sizes": "192x192", "type": "image/png", "purpose": "any"}]}
+    return Response(json.dumps(datos), mimetype="application/manifest+json")
+
+@app_web.route('/offline/sw.js')
+def offline_sw():
+    r = Response(OFFLINE_SW, mimetype="application/javascript")
+    r.headers["Service-Worker-Allowed"] = "/offline/"; r.headers["Cache-Control"] = "no-cache"; return r
+
+@app_web.route('/offline/icon.png')
+def offline_icono():
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", (192, 192), (21, 101, 192)); d = ImageDraw.Draw(img)
+    d.rounded_rectangle([34, 52, 158, 150], radius=10, fill=(255, 255, 255))
+    d.rectangle([34, 52, 158, 76], fill=(187, 222, 251))
+    d.text((96, 114), "AT", font=_fuente(44, True), fill=(21, 101, 192), anchor="mm")
+    buf = io.BytesIO(); img.save(buf, format="PNG")
+    return Response(buf.getvalue(), mimetype="image/png", headers={"Cache-Control": "public, max-age=86400"})
+
 if __name__ == "__main__":
     def iniciar_flask():
         import os
@@ -2460,6 +3096,18 @@ if __name__ == "__main__":
     app.add_handler(TypeHandler(Update, fijar_actor), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("cargar", cargar_inicio), CallbackQueryHandler(cargar_inicio, pattern="^accion_cargar$")],
+        states={
+            CG_DATOS: [MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.Document.ALL, cargar_recibir)],
+            CG_CONFIRMAR: [CallbackQueryHandler(cargar_confirmar, pattern="^cg_si$"),
+                           MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.Document.ALL, cargar_recibir)],
+        },
+        fallbacks=[CommandHandler("cancelar", cancelar), CallbackQueryHandler(cancelar_a_menu, pattern="^menu_inicio$")],
+        per_message=False,
+    ))
+    app.add_handler(CommandHandler("mapa", mapa_cmd))
+    app.add_handler(CallbackQueryHandler(mapa_cb, pattern="^mapa_"))
     app.add_handler(CommandHandler("backup", backup_bd))
     app.add_handler(CommandHandler("historial", historial_cmd))
     app.add_handler(CallbackQueryHandler(papelera_cb, pattern="^pap_"))
