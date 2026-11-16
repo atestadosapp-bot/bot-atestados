@@ -2874,6 +2874,44 @@ OFFLINE_HTML = r"""<!doctype html>
   .ok { color:var(--gr); font-size:14px; }
   textarea { width:100%; min-height:90px; font:13px monospace; background:var(--bg); color:var(--tx); border:1px solid var(--bd); border-radius:8px; padding:8px; }
   .nota { font-size:13px; opacity:.8; }
+  .barra { display:flex; gap:8px; margin-bottom:8px; }
+  button.chico { margin-top:0; padding:9px; font-size:14px; }
+  .item input[type=checkbox] { width:22px; height:22px; flex:0 0 auto; }
+  .item .cuerpo { flex:1; min-width:0; }
+  .item .acc { display:flex; gap:6px; flex:0 0 auto; }
+
+  /* ---- Etiquetas (misma medida que el PDF del bot: 3 por hoja carta) ---- */
+  #zonaImpresion { display:none; }
+  .hoja { width:215.9mm; height:279.4mm; padding:12mm 10mm 0; box-sizing:border-box; break-after:page; page-break-after:always; overflow:hidden; }
+  .hoja:last-child { break-after:auto; page-break-after:auto; }
+  .etq-fila { display:flex; width:195.9mm; height:70mm; margin-bottom:14mm; }
+  .etq { position:relative; height:70mm; border:.8mm solid #000; box-sizing:border-box; color:#000; background:#fff; font-family:Helvetica, Arial, sans-serif; overflow:hidden; }
+  .etq.ancha { width:121.5mm; } .etq.angosta { width:62.7mm; }
+  .corte { width:11.8mm; position:relative; }
+  .corte::after { content:""; position:absolute; left:50%; top:0; bottom:0; border-left:.5mm dashed #000; }
+  .etq .hd { position:absolute; left:0; right:0; top:0; text-align:center; font-weight:bold; background:#ddd; border-bottom:.8mm solid #000; white-space:nowrap; overflow:hidden; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+  .etq .del, .etq .al, .etq .no, .etq .gr, .etq .ub { position:absolute; left:0; right:0; white-space:nowrap; }
+  .etq .ln1, .etq .ln2 { position:absolute; left:0; right:0; height:0; border-top:.8mm solid #000; }
+  .ancha .hd { height:12mm; line-height:11mm; font-size:20pt; }
+  .ancha .del { top:14mm; padding-left:3mm; font-size:16pt; font-weight:bold; }
+  .ancha .al { top:22mm; padding-left:3mm; font-size:16pt; font-weight:bold; }
+  .ancha .ln1 { top:30mm; } .ancha .ln2 { top:58mm; }
+  .ancha .no { top:33mm; text-align:center; font-size:38pt; font-weight:bold; line-height:18mm; }
+  .ancha .gr { top:52mm; text-align:right; padding-right:3mm; font-size:9pt; color:#555; }
+  .ancha .ub { top:60mm; text-align:center; font-size:14pt; }
+  .angosta .hd { height:10mm; line-height:9mm; font-size:11pt; }
+  .angosta .del { top:12mm; text-align:center; font-size:12pt; font-weight:bold; }
+  .angosta .al { top:18mm; text-align:center; font-size:12pt; font-weight:bold; }
+  .angosta .ln1 { top:25mm; } .angosta .ln2 { top:52mm; }
+  .angosta .no { top:28mm; text-align:center; font-size:30pt; font-weight:bold; line-height:15mm; }
+  .angosta .gr { top:45mm; text-align:right; padding-right:2mm; font-size:8pt; color:#555; }
+  .angosta .ub { top:54mm; text-align:center; font-size:10pt; }
+  @media print {
+    @page { size:letter portrait; margin:0; }
+    html, body { background:#fff !important; color:#000 !important; padding:0 !important; margin:0 !important; }
+    body > *:not(#zonaImpresion) { display:none !important; }
+    #zonaImpresion { display:block; }
+  }
 </style>
 </head>
 <body>
@@ -2892,9 +2930,16 @@ OFFLINE_HTML = r"""<!doctype html>
   <button class="btn sec" id="cancelarEdicion" style="display:none">Cancelar edición</button>
   <p class="nota">Los datos se guardan en este celular. Al tener internet, envíalos al bot con el botón de abajo.</p>
 </div>
+<div id="guardado"></div>
 
 <h2>Pendientes de enviar (<span id="n">0</span>)</h2>
+<div class="barra"><button class="btn sec chico" id="selTodo">Seleccionar todas</button><button class="btn sec chico" id="selNada">Ninguna</button></div>
 <div id="lista"></div>
+
+<div class="card">
+  <button class="btn" id="imprimirSel">🏷️ Imprimir etiquetas seleccionadas (0)</button>
+  <p class="nota">Se imprimen 3 etiquetas por hoja carta (ancha + angosta). En la vista de impresión elige tu impresora o «Guardar como PDF». Si dejaste el N° General vacío, la etiqueta mostrará «-».</p>
+</div>
 
 <div class="card">
   <button class="btn" id="compartir">📤 Enviar al bot (compartir)</button>
@@ -2904,6 +2949,8 @@ OFFLINE_HTML = r"""<!doctype html>
   <p class="nota">En Telegram, abre el bot, usa <b>/cargar</b> y pega el texto (o sube el archivo). Cuando el bot confirme la carga, vuelve aquí y pulsa «Vaciar lista».</p>
   <button class="btn pel" id="vaciar">🗑️ Vaciar lista (ya enviada)</button>
 </div>
+
+<div id="zonaImpresion"></div>
 
 <script>
 /*PURAS*/
@@ -2947,6 +2994,23 @@ function validar(tipo, d) {
     if (parseInt(d.fin, 10) < parseInt(d.ini, 10)) return 'El evento AL no puede ser menor que el DEL.';
   }
   return '';
+}
+function esc(v) { return String(v === undefined || v === null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function fechaDMA(f) { const p = String(f || '').split('-'); return p.length === 3 ? p[2] + '/' + p[1] + '/' + p[0] : String(f || ''); }
+function etiquetaHTML(it) {
+  const d = it.datos, gen = d.gen ? esc(d.gen) : '-';
+  const ubic = 'E' + esc(d.est) + '-F' + esc(d.fila) + '-' + esc(String(d.col).toUpperCase()) + '-P' + esc(d.pila);
+  let enc, del, al;
+  if (it.tipo === 'E') { enc = esc(d.usuario); del = esc(fechaDMA(d.del)); al = esc(fechaDMA(d.al)); }
+  else { enc = esc(String(d.tipo).toUpperCase() + ' - ' + d.anio); del = esc(d.ini); al = esc(d.fin); }
+  const no = 'No. ' + esc(d.paq);
+  const cuerpo = (clase, grLabel, ubLabel) => '<div class="etq ' + clase + '"><div class="hd">' + enc + '</div><div class="del">DEL: ' + del + '</div><div class="al">AL: ' + al + '</div><div class="ln1"></div><div class="no">' + no + '</div><div class="gr">' + grLabel + gen + '</div><div class="ln2"></div><div class="ub">' + ubLabel + ubic + '</div></div>';
+  return '<div class="etq-fila">' + cuerpo('ancha', 'Gral. N° ', 'Ubicación: ') + '<div class="corte"></div>' + cuerpo('angosta', 'Gral. ', 'Ubic: ') + '</div>';
+}
+function hojasHTML(lista) {
+  let out = '';
+  for (let i = 0; i < lista.length; i += 3) out += '<div class="hoja">' + lista.slice(i, i + 3).map(etiquetaHTML).join('') + '</div>';
+  return out;
 }
 /*FIN_PURAS*/
 
@@ -3003,7 +3067,7 @@ function leerForm() {
 }
 function cambiarTab(t) {
   borradores[tipo] = leerForm();
-  tipo = t; editando = null;
+  tipo = t; editando = null; $('guardado').innerHTML = '';
   $('tabE').classList.toggle('act', t === 'E'); $('tabV').classList.toggle('act', t === 'V');
   $('cancelarEdicion').style.display = 'none'; $('agregar').textContent = '➕ Guardar en el celular';
   mostrarError(''); dibujarForm();
@@ -3012,6 +3076,8 @@ function claveItem(it) { const d = it.datos; return it.tipo === 'E' ? 'E|' + d.u
 function claveUbic(it) { const d = it.datos; return [d.est, parseInt(d.fila, 10), d.col.toUpperCase(), parseInt(d.pila, 10)].join('|'); }
 function dibujarLista() {
   $('n').textContent = items.length;
+  const seleccionadas = items.filter((it) => it.sel !== false).length;
+  $('imprimirSel').textContent = '🏷️ Imprimir etiquetas seleccionadas (' + seleccionadas + ')';
   const claves = {}, ubics = {};
   items.forEach((it) => { claves[claveItem(it)] = (claves[claveItem(it)] || 0) + 1; ubics[claveUbic(it)] = (ubics[claveUbic(it)] || 0) + 1; });
   $('lista').innerHTML = items.length ? '' : '<p class="nota">Aún no hay registros pendientes.</p>';
@@ -3022,7 +3088,7 @@ function dibujarLista() {
     const titulo = it.tipo === 'E' ? '👤 ' + d.usuario + ' · Paq ' + d.paq : '📖 ' + d.tipo + ' ' + d.anio + ' · Paq ' + d.paq;
     const detalle = it.tipo === 'E' ? d.del + ' → ' + d.al : 'Eventos ' + d.ini + '-' + d.fin;
     const div = document.createElement('div'); div.className = 'card item';
-    div.innerHTML = '<div><b>' + titulo + '</b><small>' + detalle + ' · E' + d.est + '-F' + d.fila + '-' + d.col + '-P' + d.pila + (d.gen ? ' · Gen ' + d.gen : '') + '</small>' + av.map((a) => '<span class="aviso">' + a + '</span>').join('<br>') + '</div><div><button data-e="' + i + '">✏️</button> <button data-b="' + i + '">🗑️</button></div>';
+    div.innerHTML = '<input type="checkbox" data-s="' + i + '"' + (it.sel !== false ? ' checked' : '') + ' aria-label="Incluir en la impresión"><div class="cuerpo"><b>' + esc(titulo) + '</b><small>' + esc(detalle) + ' · E' + esc(d.est) + '-F' + esc(d.fila) + '-' + esc(d.col) + '-P' + esc(d.pila) + (d.gen ? ' · Gen ' + esc(d.gen) : '') + '</small>' + av.map((a) => '<span class="aviso">' + a + '</span>').join('<br>') + '</div><div class="acc"><button data-p="' + i + '" title="Imprimir etiqueta">🏷️</button><button data-e="' + i + '">✏️</button><button data-b="' + i + '">🗑️</button></div>';
     $('lista').appendChild(div);
   });
 }
@@ -3030,11 +3096,21 @@ function agregar() {
   const d = leerForm(), err = validar(tipo, d);
   if (err) { mostrarError(err); return; }
   mostrarError(''); msg('');
-  if (editando !== null) { items[editando] = { tipo, datos: d, ts: items[editando].ts }; editando = null; }
-  else items.push({ tipo, datos: d, ts: Date.now() });
+  let indice;
+  if (editando !== null) { items[editando] = { tipo, datos: d, ts: items[editando].ts, sel: items[editando].sel }; indice = editando; editando = null; }
+  else { items.push({ tipo, datos: d, ts: Date.now(), sel: true }); indice = items.length - 1; }
   borradores[tipo] = sugerirSiguiente(tipo, d);
   guardar(); $('cancelarEdicion').style.display = 'none'; $('agregar').textContent = '➕ Guardar en el celular';
-  dibujarForm(); dibujarLista(); window.scrollTo({ top: 0, behavior: 'smooth' });
+  dibujarForm(); dibujarLista();
+  $('guardado').innerHTML = '<div class="card"><span class="ok">✅ Guardado en el celular.</span><button class="btn" id="impUltima">🏷️ Imprimir la etiqueta de este paquete</button></div>';
+  $('impUltima').onclick = () => imprimir([items[indice]]);
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+function imprimir(lista) {
+  lista = lista.filter(Boolean);
+  if (!lista.length) { msg('Selecciona al menos un registro para imprimir.'); return; }
+  msg(''); $('zonaImpresion').innerHTML = hojasHTML(lista);
+  setTimeout(() => window.print(), 150);
 }
 function textoExport() { return items.map(linea).join('\n'); }
 async function copiar() {
@@ -3061,13 +3137,19 @@ function vaciar() {
 function estadoRed() { const on = navigator.onLine; const e = $('estado'); e.className = on ? 'on' : 'off'; e.textContent = on ? 'Conectado: ya puedes enviar los pendientes al bot' : 'Sin internet: guarda aquí los registros y envíalos después'; }
 
 $('tabE').onclick = () => cambiarTab('E'); $('tabV').onclick = () => cambiarTab('V');
+$('imprimirSel').onclick = () => imprimir(items.filter((it) => it.sel !== false));
+$('selTodo').onclick = () => { items.forEach((it) => { it.sel = true; }); guardar(); dibujarLista(); };
+$('selNada').onclick = () => { items.forEach((it) => { it.sel = false; }); guardar(); dibujarLista(); };
 $('agregar').onclick = agregar; $('copiar').onclick = copiar; $('compartir').onclick = compartir; $('descargar').onclick = descargar; $('vaciar').onclick = vaciar;
 $('cancelarEdicion').onclick = () => { editando = null; $('cancelarEdicion').style.display = 'none'; $('agregar').textContent = '➕ Guardar en el celular'; mostrarError(''); dibujarForm(); };
 $('lista').onclick = (ev) => {
+  const bp = ev.target.getAttribute('data-p');
+  if (bp !== null) { imprimir([items[+bp]]); return; }
   const be = ev.target.getAttribute('data-e'), bb = ev.target.getAttribute('data-b');
   if (be !== null) { const it = items[+be]; if (it.tipo !== tipo) cambiarTab(it.tipo); borradores[tipo] = Object.assign({}, it.datos); editando = +be; dibujarForm(); $('cancelarEdicion').style.display = 'block'; $('agregar').textContent = '💾 Guardar cambios'; window.scrollTo({ top: 0, behavior: 'smooth' }); }
   if (bb !== null && confirm('¿Eliminar este registro pendiente?')) { items.splice(+bb, 1); guardar(); dibujarLista(); }
 };
+$('lista').onchange = (ev) => { const s = ev.target.getAttribute('data-s'); if (s !== null) { items[+s].sel = ev.target.checked; guardar(); dibujarLista(); } };
 window.addEventListener('online', estadoRed); window.addEventListener('offline', estadoRed);
 estadoRed(); dibujarForm(); dibujarLista();
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/offline/sw.js', { scope: '/offline/' }).catch(function () {});
