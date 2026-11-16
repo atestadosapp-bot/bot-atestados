@@ -737,12 +737,31 @@ def obtener_menu_principal(usuario):
     teclado.append([InlineKeyboardButton("👤 MI INFORMACIÓN", callback_data="menu_info")])
     return InlineKeyboardMarkup(teclado)
     
+async def editar_texto(query, texto, reply_markup=None, parse_mode=None):
+    """Edita el mensaje del botón. Si es una foto o un archivo (no tiene texto editable), le quita los botones
+    y envía el texto como mensaje nuevo."""
+    msg = query.message
+    if msg is not None and (msg.photo or msg.document or msg.caption):
+        try: await msg.edit_reply_markup(reply_markup=None)
+        except Exception: pass
+        await msg.reply_text(texto, reply_markup=reply_markup, parse_mode=parse_mode)
+        return
+    try:
+        await query.edit_message_text(texto, reply_markup=reply_markup, parse_mode=parse_mode)
+    except Exception as e:
+        if "no text in the message" in str(e).lower() and msg is not None:
+            try: await msg.edit_reply_markup(reply_markup=None)
+            except Exception: pass
+            await msg.reply_text(texto, reply_markup=reply_markup, parse_mode=parse_mode)
+        else:
+            raise
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await verificar_acceso(update)
     if not usuario: return
     mensaje = f"👋 *Hola, {usuario['nombre']}*\nTu rol es: `{usuario['rol']}`\nÁrea: `{usuario.get('area', 'enrolamiento').capitalize()}`\n\nSelecciona una categoría:"
     teclado = obtener_menu_principal(usuario)
-    if update.callback_query: await update.callback_query.edit_message_text(mensaje, reply_markup=teclado, parse_mode="Markdown")
+    if update.callback_query: await editar_texto(update.callback_query, mensaje, reply_markup=teclado, parse_mode="Markdown")
     else: await update.message.reply_text(mensaje, reply_markup=teclado, parse_mode="Markdown")
         
 async def botones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2455,10 +2474,11 @@ def teclado_estanterias(area):
     botones.append([InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")])
     return InlineKeyboardMarkup(botones), est
 
-async def _enviar_mapa(mensaje, area, est):
+async def _enviar_mapa(mensaje, area, est, como_archivo=False):
     nombre_area = AREAS_MAPA[area][1]
     buf, resumen = await asyncio.to_thread(generar_mapa_estanteria, area, est)
-    btn = InlineKeyboardMarkup([[InlineKeyboardButton("🗄️ Otra estantería", callback_data=f"mapa_area_{area}")],
+    btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔍 Ver en alta calidad (archivo)", callback_data=f"mapa_doc_{area}_{est}")],
+                                [InlineKeyboardButton("🗄️ Otra estantería", callback_data=f"mapa_area_{area}")],
                                 [InlineKeyboardButton("⬅️ Cambiar de área", callback_data="mapa_inicio")],
                                 [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
     if buf is None:
@@ -2466,24 +2486,30 @@ async def _enviar_mapa(mensaje, area, est):
     caption = f"🗄️ Estantería {est} · {nombre_area}: {resumen['ocupados']} ocupado(s) · {resumen['libres']} libre(s) hasta nivel {NIVELES_NORMALES}"
     if resumen["conflictos"]: caption += f"\n⚠️ {resumen['conflictos']} ubicación(es) con más de un paquete"
     if resumen["sin_ubicar"]: caption += f"\nℹ️ {resumen['sin_ubicar']} paquete(s) con ubicación incompleta no se dibujan"
-    await mensaje.reply_photo(photo=buf, caption=caption, reply_markup=btn)
+    if como_archivo:
+        await mensaje.reply_document(document=buf, filename=f"mapa_estanteria_{area}_{est}.png", caption=caption)
+    else:
+        await mensaje.reply_photo(photo=buf, caption=caption, reply_markup=btn)
 
 async def mapa_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await verificar_acceso(update)
     if not usuario: return
     query = update.callback_query; await query.answer()
     if query.data == "mapa_inicio":
-        await query.edit_message_text("🗄️ MAPA DE ESTANTERÍAS\n\n¿De qué área quieres ver la estantería?", reply_markup=teclado_areas_mapa())
+        await editar_texto(query, "🗄️ MAPA DE ESTANTERÍAS\n\n¿De qué área quieres ver la estantería?", reply_markup=teclado_areas_mapa())
     elif query.data.startswith("mapa_area_"):
         area = query.data.replace("mapa_area_", "")
         if area not in AREAS_MAPA: return
         teclado, est = teclado_estanterias(area)
         texto = (f"🗄️ {AREAS_MAPA[area][1]}\n\nElige la estantería (también puedes usar /mapa {'dpi' if area == 'E' else 'eventos'} 5):"
                  if est else f"🗄️ {AREAS_MAPA[area][1]}: aún no hay paquetes con ubicación registrados.")
-        await query.edit_message_text(texto, reply_markup=teclado)
+        await editar_texto(query, texto, reply_markup=teclado)
     elif query.data.startswith("mapa_est_"):
         area, est = query.data.replace("mapa_est_", "").split("_", 1)
         if area in AREAS_MAPA: await _enviar_mapa(query.message, area, est)
+    elif query.data.startswith("mapa_doc_"):
+        area, est = query.data.replace("mapa_doc_", "").split("_", 1)
+        if area in AREAS_MAPA: await _enviar_mapa(query.message, area, est, como_archivo=True)
 
 async def mapa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await verificar_acceso(update)
