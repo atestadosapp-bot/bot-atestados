@@ -2247,7 +2247,7 @@ async def registrar_evento_otro_cb(update: Update, context: ContextTypes.DEFAULT
 # --- Reglas físicas de las estanterías y sugerencia de ubicación ---
 NIVELES_NORMALES = 4          # niveles (pilas) por columna; en raras ocasiones caben 5
 COLUMNAS_BASE = "ABCD"        # columnas normales de una estantería
-COLUMNAS_POR_ESTANTERIA = {}  # estanterías con más columnas, ej.: {"7": "ABCDEF"}
+COLUMNAS_POR_ESTANTERIA = {"paquetes": {}, "eventos": {}}  # estanterías con más columnas, ej.: {"paquetes": {"7": "ABCDEF"}}
 FILA_SIN_TECHO = "0"          # la fila 0 no tiene techo: los niveles no tienen límite
 
 def texto_ubicacion(u):
@@ -2255,7 +2255,7 @@ def texto_ubicacion(u):
 
 def columnas_estanteria(tabla, est):
     """Columnas disponibles: A-D por defecto; hasta F si la estantería lo tiene configurado o ya usa E/F."""
-    if str(est) in COLUMNAS_POR_ESTANTERIA: return COLUMNAS_POR_ESTANTERIA[str(est)]
+    if str(est) in COLUMNAS_POR_ESTANTERIA.get(tabla, {}): return COLUMNAS_POR_ESTANTERIA[tabla][str(est)]
     try:
         r = conectar_db().execute(f"SELECT MAX(UPPER(columna)) FROM {tabla} WHERE estanteria = ?", (est,))
         mayor = r.rows[0][0] if r.rows and r.rows[0][0] else "D"
@@ -2339,8 +2339,9 @@ async def ev_ubic_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d["ev_est"], d["ev_fil"], d["ev_col"], d["ev_pil"] = d["alt5"] if query.data == "evsugubi_n5" else d["sug_ubic"]
     return await _ev_guardar(update, context)
 
-# --- MAPA DE ESTANTERÍAS (imagen con filas, columnas y niveles; libres y ocupados) ---
-FILAS_POR_ESTANTERIA = {}  # opcional: {"5": 6} fuerza hasta qué fila se dibuja (ej.: filas 0 a 6)
+# --- MAPA DE ESTANTERÍAS (una imagen por área: las estanterías de Enrolamiento y de Eventos son distintas) ---
+FILAS_POR_ESTANTERIA = {"paquetes": {}, "eventos": {}}  # opcional: {"paquetes": {"5": 6}} dibuja filas 0 a 6 en la estantería 5 de Enrolamiento
+AREAS_MAPA = {"E": ("paquetes", "Enrolamiento DPI"), "V": ("eventos", "Eventos SIRECI")}
 
 def _fuente(tamano, negrita=False):
     from PIL import ImageFont
@@ -2350,48 +2351,43 @@ def _fuente(tamano, negrita=False):
     try: return ImageFont.load_default(size=tamano)
     except TypeError: return ImageFont.load_default()
 
-def lista_estanterias():
-    client = conectar_db()
+def lista_estanterias(area):
+    tabla = AREAS_MAPA[area][0]
     vistas = set()
-    for tabla in ("paquetes", "eventos"):
-        for r in client.execute(f"SELECT DISTINCT estanteria FROM {tabla}").rows:
-            if r[0] is not None and str(r[0]).strip() != "": vistas.add(str(r[0]).strip())
+    for r in conectar_db().execute(f"SELECT DISTINCT estanteria FROM {tabla}").rows:
+        if r[0] is not None and str(r[0]).strip() != "": vistas.add(str(r[0]).strip())
     return sorted(vistas, key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
 
-def datos_estanteria(est):
-    """Devuelve ({(fila, columna, nivel): [(tipo, etiqueta), ...]}, cantidad_sin_ubicar)."""
-    client = conectar_db()
+def datos_estanteria(area, est):
+    """Devuelve ({(fila, columna, nivel): [etiqueta, ...]}, cantidad_sin_ubicar) solo del área indicada."""
     ocupados, sin_ubicar = {}, 0
-    consultas = (
-        ("E", "SELECT usuario_codigo, num_paquete, fila, columna, pila FROM paquetes WHERE estanteria = ?"),
-        ("V", "SELECT tipo_evento, anio, num_paquete, fila, columna, pila FROM eventos WHERE estanteria = ?"),
-    )
-    for tipo, sql in consultas:
-        for r in client.execute(sql, (est,)).rows:
-            if tipo == "E":
-                etiqueta = f"{str(r[0])[:7]} #{r[1]}"; fila, col, pila = r[2], r[3], r[4]
-            else:
-                etiqueta = f"{str(r[0])[:3]} {str(r[1])[-2:]} #{r[2]}"; fila, col, pila = r[3], r[4], r[5]
-            fila, col, pila = str(fila).strip(), str(col).strip().upper(), str(pila).strip()
-            if not (fila.isdigit() and pila.isdigit() and len(col) == 1 and col.isalpha()):
-                sin_ubicar += 1; continue
-            ocupados.setdefault((int(fila), col, int(pila)), []).append((tipo, etiqueta))
+    if area == "E":
+        filas = conectar_db().execute("SELECT usuario_codigo, num_paquete, fila, columna, pila FROM paquetes WHERE estanteria = ?", (est,)).rows
+        registros = [(f"{str(r[0])[:7]} #{r[1]}", r[2], r[3], r[4]) for r in filas]
+    else:
+        filas = conectar_db().execute("SELECT tipo_evento, anio, num_paquete, fila, columna, pila FROM eventos WHERE estanteria = ?", (est,)).rows
+        registros = [(f"{str(r[0])[:3]} {str(r[1])[-2:]} #{r[2]}", r[3], r[4], r[5]) for r in filas]
+    for etiqueta, fila, col, pila in registros:
+        fila, col, pila = str(fila).strip(), str(col).strip().upper(), str(pila).strip()
+        if not (fila.isdigit() and pila.isdigit() and len(col) == 1 and col.isalpha()):
+            sin_ubicar += 1; continue
+        ocupados.setdefault((int(fila), col, int(pila)), []).append(etiqueta)
     return ocupados, sin_ubicar
 
-def generar_mapa_estanteria(est):
+def generar_mapa_estanteria(area, est):
     """Dibuja la estantería. Devuelve (bytes_png, resumen) o (None, None) si no hay datos."""
     from PIL import Image, ImageDraw
-    ocupados, sin_ubicar = datos_estanteria(est)
+    tabla, nombre_area = AREAS_MAPA[area]
+    ocupados, sin_ubicar = datos_estanteria(area, est)
     if not ocupados: return None, None
-    max_fila = max(f for f, _, _ in ocupados)
-    max_fila = max(max_fila, FILAS_POR_ESTANTERIA.get(str(est), 0))
+    max_fila = max(max(f for f, _, _ in ocupados), FILAS_POR_ESTANTERIA.get(tabla, {}).get(str(est), 0))
     filas = list(range(0, max_fila + 1))
     usadas = {c for _, c, _ in ocupados}
-    if str(est) in COLUMNAS_POR_ESTANTERIA: columnas = COLUMNAS_POR_ESTANTERIA[str(est)]
+    if str(est) in COLUMNAS_POR_ESTANTERIA.get(tabla, {}): columnas = COLUMNAS_POR_ESTANTERIA[tabla][str(est)]
     else:
         mayor = max(usadas | {"D"})
         columnas = "ABCDEF"[: "ABCDEF".index(mayor) + 1] if mayor in "ABCDEF" else COLUMNAS_BASE
-        columnas += "".join(sorted(c for c in usadas if c not in columnas))
+    columnas += "".join(sorted(c for c in usadas if c not in columnas))
     niveles = {}
     for f in filas:
         usados = [n for (ff, _, n) in ocupados if ff == f]
@@ -2401,9 +2397,9 @@ def generar_mapa_estanteria(est):
     alto = margen_sup + sum(niveles[f] * alto_caja + espacio for f in filas) + 64
     img = Image.new("RGB", (ancho, alto), "white"); d = ImageDraw.Draw(img)
     f_tit, f_sub, f_txt, f_peq = _fuente(24, True), _fuente(15), _fuente(14), _fuente(12)
-    colores = {"libre": ((232, 245, 233), (129, 199, 132)), "E": ((187, 222, 251), (21, 101, 192)),
-               "V": ((255, 224, 178), (230, 126, 0)), "conflicto": ((255, 205, 210), (198, 40, 40))}
-    libres = ocup_e = ocup_v = conflictos = 0
+    color_area = (((187, 222, 251), (21, 101, 192)) if area == "E" else ((255, 224, 178), (230, 126, 0)))
+    colores = {"libre": ((232, 245, 233), (129, 199, 132)), "ocupado": color_area, "conflicto": ((255, 205, 210), (198, 40, 40))}
+    libres = ocupados_n = conflictos = 0
     for i, c in enumerate(columnas):
         x = margen_izq + i * ancho_celda
         d.text((x + ancho_celda / 2, margen_sup - 14), f"Columna {c}", font=f_txt, fill=(40, 40, 40), anchor="ms")
@@ -2419,50 +2415,55 @@ def generar_mapa_estanteria(est):
                 registros = ocupados.get((f, c, nivel), [])
                 if not registros:
                     clave = "libre"
-                    if f > 0 and nivel > NIVELES_NORMALES: texto = f"N{nivel} (extra)"
-                    else: texto = f"N{nivel}"
-                    if f == 0 or nivel <= NIVELES_NORMALES: libres += (0 if f == 0 else 1)
+                    texto = f"N{nivel} (extra)" if (f > 0 and nivel > NIVELES_NORMALES) else f"N{nivel}"
+                    if f > 0 and nivel <= NIVELES_NORMALES: libres += 1
                 elif len(registros) > 1:
                     clave, texto = "conflicto", f"! {len(registros)} paquetes"; conflictos += 1
                 else:
-                    clave, texto = registros[0][0], registros[0][1]
-                    if clave == "E": ocup_e += 1
-                    else: ocup_v += 1
+                    clave, texto = "ocupado", registros[0]; ocupados_n += 1
                 relleno, borde = colores[clave]
                 d.rectangle([x + 3, top + 2, x + ancho_celda - 3, top + alto_caja - 2], fill=relleno, outline=borde, width=2)
                 d.text((x + ancho_celda / 2, top + alto_caja / 2), texto, font=f_txt if clave != "libre" else f_peq,
                        fill=(30, 30, 30) if clave != "libre" else (90, 140, 95), anchor="mm")
         y += n * alto_caja + espacio
-    d.text((margen_izq, 14), f"Estantería {est}", font=f_tit, fill=(20, 20, 20))
-    total_ocup = ocup_e + ocup_v + conflictos
+    d.text((margen_izq, 14), f"Estantería {est} · {nombre_area}", font=f_tit, fill=(20, 20, 20))
+    total_ocup = ocupados_n + conflictos
     d.text((margen_izq, 46), f"{total_ocup} nivel(es) ocupado(s) · {libres} libre(s) hasta el nivel {NIVELES_NORMALES} (sin contar la fila 0)", font=f_sub, fill=(70, 70, 70))
     ly = y + 14
-    for j, (clave, nombre) in enumerate((("libre", "Libre"), ("E", "Enrolamiento"), ("V", "Eventos"), ("conflicto", "Ocupado 2+ veces"))):
+    for j, (clave, nombre) in enumerate((("libre", "Libre"), ("ocupado", "Ocupado"), ("conflicto", "Ocupado 2+ veces"))):
         lx = margen_izq + j * 150
         relleno, borde = colores[clave]
         d.rectangle([lx, ly, lx + 18, ly + 18], fill=relleno, outline=borde, width=2)
         d.text((lx + 26, ly + 9), nombre, font=f_peq, fill=(60, 60, 60), anchor="lm")
     buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
-    resumen = {"ocupados": total_ocup, "libres": libres, "conflictos": conflictos, "sin_ubicar": sin_ubicar, "enrolamiento": ocup_e, "eventos": ocup_v}
-    return buf, resumen
+    return buf, {"ocupados": total_ocup, "libres": libres, "conflictos": conflictos, "sin_ubicar": sin_ubicar}
 
-def teclado_estanterias():
-    est = lista_estanterias()
+def teclado_areas_mapa():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Enrolamiento DPI", callback_data="mapa_area_E")],
+        [InlineKeyboardButton("📖 Eventos SIRECI", callback_data="mapa_area_V")],
+        [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+
+def teclado_estanterias(area):
+    est = lista_estanterias(area)
     botones, fila_ = [], []
     for e in est:
-        fila_.append(InlineKeyboardButton(f"E{e}", callback_data=f"mapa_est_{e}"))
+        fila_.append(InlineKeyboardButton(f"E{e}", callback_data=f"mapa_est_{area}_{e}"))
         if len(fila_) == 4: botones.append(fila_); fila_ = []
     if fila_: botones.append(fila_)
+    botones.append([InlineKeyboardButton("⬅️ Cambiar de área", callback_data="mapa_inicio")])
     botones.append([InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")])
     return InlineKeyboardMarkup(botones), est
 
-async def _enviar_mapa(mensaje, est):
-    buf, resumen = await asyncio.to_thread(generar_mapa_estanteria, est)
-    btn = InlineKeyboardMarkup([[InlineKeyboardButton("🗄️ Ver otra estantería", callback_data="mapa_inicio")],
+async def _enviar_mapa(mensaje, area, est):
+    nombre_area = AREAS_MAPA[area][1]
+    buf, resumen = await asyncio.to_thread(generar_mapa_estanteria, area, est)
+    btn = InlineKeyboardMarkup([[InlineKeyboardButton("🗄️ Otra estantería", callback_data=f"mapa_area_{area}")],
+                                [InlineKeyboardButton("⬅️ Cambiar de área", callback_data="mapa_inicio")],
                                 [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
     if buf is None:
-        await mensaje.reply_text(f"🗄️ La estantería {est} no tiene paquetes registrados todavía.", reply_markup=btn); return
-    caption = f"🗄️ Estantería {est}: {resumen['ocupados']} ocupado(s) · {resumen['libres']} libre(s) hasta nivel {NIVELES_NORMALES}"
+        await mensaje.reply_text(f"🗄️ La estantería {est} de {nombre_area} no tiene paquetes registrados todavía.", reply_markup=btn); return
+    caption = f"🗄️ Estantería {est} · {nombre_area}: {resumen['ocupados']} ocupado(s) · {resumen['libres']} libre(s) hasta nivel {NIVELES_NORMALES}"
     if resumen["conflictos"]: caption += f"\n⚠️ {resumen['conflictos']} ubicación(es) con más de un paquete"
     if resumen["sin_ubicar"]: caption += f"\nℹ️ {resumen['sin_ubicar']} paquete(s) con ubicación incompleta no se dibujan"
     await mensaje.reply_photo(photo=buf, caption=caption, reply_markup=btn)
@@ -2472,20 +2473,32 @@ async def mapa_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not usuario: return
     query = update.callback_query; await query.answer()
     if query.data == "mapa_inicio":
-        teclado, est = teclado_estanterias()
-        texto = "🗄️ MAPA DE ESTANTERÍAS\n\nElige la estantería (también puedes usar /mapa 5):" if est else "🗄️ Aún no hay paquetes con ubicación registrados."
+        await query.edit_message_text("🗄️ MAPA DE ESTANTERÍAS\n\n¿De qué área quieres ver la estantería?", reply_markup=teclado_areas_mapa())
+    elif query.data.startswith("mapa_area_"):
+        area = query.data.replace("mapa_area_", "")
+        if area not in AREAS_MAPA: return
+        teclado, est = teclado_estanterias(area)
+        texto = (f"🗄️ {AREAS_MAPA[area][1]}\n\nElige la estantería (también puedes usar /mapa {'dpi' if area == 'E' else 'eventos'} 5):"
+                 if est else f"🗄️ {AREAS_MAPA[area][1]}: aún no hay paquetes con ubicación registrados.")
         await query.edit_message_text(texto, reply_markup=teclado)
     elif query.data.startswith("mapa_est_"):
-        await _enviar_mapa(query.message, query.data.replace("mapa_est_", ""))
+        area, est = query.data.replace("mapa_est_", "").split("_", 1)
+        if area in AREAS_MAPA: await _enviar_mapa(query.message, area, est)
 
 async def mapa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await verificar_acceso(update)
     if not usuario: return
-    if context.args:
-        await _enviar_mapa(update.message, context.args[0].strip())
-    else:
-        teclado, est = teclado_estanterias()
-        await update.message.reply_text("🗄️ MAPA DE ESTANTERÍAS\n\nElige la estantería:" if est else "🗄️ Aún no hay paquetes con ubicación registrados.", reply_markup=teclado)
+    args = [a.strip() for a in (context.args or [])]
+    area = None
+    if args:
+        if args[0].lower() in ("e", "dpi", "enrolamiento"): area = "E"
+        elif args[0].lower() in ("v", "ev", "evento", "eventos"): area = "V"
+    if area and len(args) >= 2:
+        await _enviar_mapa(update.message, area, args[1]); return
+    if area:
+        teclado, est = teclado_estanterias(area)
+        await update.message.reply_text(f"🗄️ {AREAS_MAPA[area][1]}\n\nElige la estantería:" if est else f"🗄️ {AREAS_MAPA[area][1]}: aún no hay paquetes con ubicación registrados.", reply_markup=teclado); return
+    await update.message.reply_text("🗄️ MAPA DE ESTANTERÍAS\n\n¿De qué área quieres ver la estantería?\n(También: /mapa dpi 5  o  /mapa eventos 5)", reply_markup=teclado_areas_mapa())
 
 # --- CARGA MASIVA: sube los registros guardados sin internet ---
 MAX_LINEAS_CARGA = 300
