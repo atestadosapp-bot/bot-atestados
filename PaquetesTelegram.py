@@ -869,7 +869,9 @@ async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except: await update.message.reply_text("⚠️ Número inválido."); return
     res = buscar_por_dpi_y_numero(dpi, num)
     if not res: await update.message.reply_text(f"❌ No se encontró `{dpi}` N° {num}.", parse_mode="Markdown")
-    else: await update.message.reply_text(formatear_mensaje(res), parse_mode="Markdown")
+    else:
+        await update.message.reply_text(formatear_mensaje(res), parse_mode="Markdown")
+        await enviar_mapas_resultado(update.message, "E", [res])
 
 async def etiqueta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await verificar_acceso(update)
@@ -910,7 +912,9 @@ async def general(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError: await update.message.reply_text("⚠️ El número debe ser entero."); return
     resultado = buscar_por_numero_general(num_gen)
     if not resultado: await update.message.reply_text(f"❌ No se encontró el general *{num_gen}*.", parse_mode="Markdown")
-    else: await update.message.reply_text(formatear_mensaje(resultado), parse_mode="Markdown")
+    else:
+        await update.message.reply_text(formatear_mensaje(resultado), parse_mode="Markdown")
+        await enviar_mapas_resultado(update.message, "E", [resultado])
 
 async def fecha(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await verificar_acceso(update)
@@ -927,6 +931,7 @@ async def fecha(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mensaje += f"📦 N° *{r.get('num_paquete')}* (Gen: {gen_txt})\n   📍 `{r.get('ubicacion_armada')}`\n\n"
         if len(mensaje) > 3800: await update.message.reply_text(mensaje, parse_mode="Markdown"); mensaje = ""
     if mensaje: await update.message.reply_text(mensaje, parse_mode="Markdown")
+    await enviar_mapas_resultado(update.message, "E", resultados)
 
 async def usuario_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await verificar_acceso(update)
@@ -944,6 +949,7 @@ async def usuario_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mensaje += f"📦 N° *{r.get('num_paquete')}* (Gen: {gen_txt}) → `{r.get('ubicacion_armada')}`\n   📅 {r.get('fecha_del')} al {r.get('fecha_al')}\n\n"
         if len(mensaje) > 3800: await update.message.reply_text(mensaje, parse_mode="Markdown"); mensaje = ""
     if mensaje: await update.message.reply_text(mensaje, parse_mode="Markdown")
+    await enviar_mapas_resultado(update.message, "E", resultados)
 
 async def eliminar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
@@ -1350,6 +1356,7 @@ async def flujo_buscar_folio(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if len(resultados) > 1:
             mensaje = f"ℹ️ El {folio} aparece en {len(resultados)} paquetes:\n\n" + mensaje
         await update.message.reply_text(mensaje, reply_markup=btn_volver)
+        await enviar_mapas_resultado(update.message, "V", resultados)
     else: await update.message.reply_text(f"❌ No se encontró paquete para el evento {folio}.", reply_markup=btn_volver)
     return ConversationHandler.END
 
@@ -1363,7 +1370,9 @@ async def flujo_buscar_general(update: Update, context: ContextTypes.DEFAULT_TYP
     except: await update.message.reply_text("⚠️ Debe ser un número entero:"); return EV_BUS_GENERAL
     res = buscar_evento_por_general(num_gen)
     btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
-    if res: await update.message.reply_text(texto_evento(res), reply_markup=btn_volver)
+    if res:
+        await update.message.reply_text(texto_evento(res), reply_markup=btn_volver)
+        await enviar_mapas_resultado(update.message, "V", [res])
     else: await update.message.reply_text(f"❌ No se encontró paquete con N° General {num_gen}.", reply_markup=btn_volver)
     return ConversationHandler.END
 
@@ -1443,6 +1452,8 @@ async def _continuar_con_paquete(mensaje, context, paquete):
         await _enviar_etiqueta_evento(mensaje, paquete)
         await mensaje.reply_text("¿Algo más?", reply_markup=btn_volver)
         context.user_data.clear(); return ConversationHandler.END
+    if accion in ("editar", "eliminar"):
+        await enviar_mapas_resultado(mensaje, "V", [paquete])
     if accion == "eliminar":
         teclado = InlineKeyboardMarkup([
             [InlineKeyboardButton("🗑️ Sí, eliminar", callback_data="evdel_si")],
@@ -1578,6 +1589,7 @@ async def evf_recibir(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(bloque); bloque = ""
             bloque += linea
         await update.message.reply_text(bloque or "Fin.", reply_markup=btn_volver)
+        await enviar_mapas_resultado(update.message, "V", resultados)
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1649,6 +1661,8 @@ async def _ep_continuar(mensaje, context, paquete, usuario_rol=None):
         await _enviar_etiqueta_paquete(mensaje, paquete)
         await mensaje.reply_text("¿Algo más?", reply_markup=btn_volver)
         d.clear(); return ConversationHandler.END
+    if accion in ("editar", "eliminar"):
+        await enviar_mapas_resultado(mensaje, "E", [paquete])
     if accion == "eliminar":
         teclado = InlineKeyboardMarkup([
             [InlineKeyboardButton("🗑️ Sí, eliminar", callback_data="epdel_si")],
@@ -2393,10 +2407,12 @@ def datos_estanteria(area, est):
         ocupados.setdefault((int(fila), col, int(pila)), []).append(etiqueta)
     return ocupados, sin_ubicar
 
-def generar_mapa_estanteria(area, est):
-    """Dibuja la estantería. Devuelve (bytes_png, resumen) o (None, None) si no hay datos."""
+def generar_mapa_estanteria(area, est, resaltar=None):
+    """Dibuja la estantería. `resaltar` = {(fila, columna, nivel)} se marca con amarillo, borde rojo y flechas.
+    Devuelve (bytes_png, resumen) o (None, None) si no hay datos."""
     from PIL import Image, ImageDraw
     tabla, nombre_area = AREAS_MAPA[area]
+    resaltar = set(resaltar or [])
     ocupados, sin_ubicar = datos_estanteria(area, est)
     if not ocupados: return None, None
     max_fila = max(max(f for f, _, _ in ocupados), FILAS_POR_ESTANTERIA.get(tabla, {}).get(str(est), 0))
@@ -2411,51 +2427,91 @@ def generar_mapa_estanteria(area, est):
     for f in filas:
         usados = [n for (ff, _, n) in ocupados if ff == f]
         niveles[f] = max(NIVELES_NORMALES, (max(usados) + 1) if (f == 0 and usados) else (max(usados) if usados else 0))
-    ancho_celda, alto_caja, margen_izq, margen_sup, espacio = 178, 30, 78, 96, 14
+    ancho_celda, alto_caja, margen_izq, margen_sup, espacio = 178, 30, 100, 122, 14
     ancho = margen_izq + len(columnas) * ancho_celda + 20
     alto = margen_sup + sum(niveles[f] * alto_caja + espacio for f in filas) + 64
     img = Image.new("RGB", (ancho, alto), "white"); d = ImageDraw.Draw(img)
-    f_tit, f_sub, f_txt, f_peq = _fuente(24, True), _fuente(15), _fuente(14), _fuente(12)
+    f_tit, f_sub, f_txt, f_txt_b, f_peq = _fuente(24, True), _fuente(15), _fuente(14), _fuente(14, True), _fuente(12)
+    ROJO = (213, 0, 0)
     color_area = (((187, 222, 251), (21, 101, 192)) if area == "E" else ((255, 224, 178), (230, 126, 0)))
-    colores = {"libre": ((232, 245, 233), (129, 199, 132)), "ocupado": color_area, "conflicto": ((255, 205, 210), (198, 40, 40))}
-    libres = ocupados_n = conflictos = 0
+    colores = {"libre": ((232, 245, 233), (129, 199, 132)), "ocupado": color_area, "conflicto": ((255, 205, 210), (198, 40, 40)),
+               "resaltado": ((255, 235, 59), ROJO)}
+    filas_res = {f for (f, c, n) in resaltar}; cols_res = {c for (f, c, n) in resaltar}
+    libres = ocupados_n = conflictos = marcados = 0
     for i, c in enumerate(columnas):
-        x = margen_izq + i * ancho_celda
-        d.text((x + ancho_celda / 2, margen_sup - 14), f"Columna {c}", font=f_txt, fill=(40, 40, 40), anchor="ms")
+        x = margen_izq + i * ancho_celda; xc = x + ancho_celda / 2
+        en_res = c in cols_res
+        d.text((xc, margen_sup - 42), f"Columna {c}", font=f_txt_b if en_res else f_txt, fill=ROJO if en_res else (40, 40, 40), anchor="ms")
+        if en_res: d.polygon([(xc - 10, margen_sup - 34), (xc + 10, margen_sup - 34), (xc, margen_sup - 16)], fill=ROJO)
     y = margen_sup
     for f in filas:
         n = niveles[f]
-        d.text((margen_izq - 10, y + n * alto_caja / 2), f"Fila {f}", font=f_txt, fill=(40, 40, 40), anchor="rm")
-        if f == 0: d.text((margen_izq - 10, y + n * alto_caja / 2 + 16), "sin techo", font=f_peq, fill=(120, 120, 120), anchor="rm")
+        en_res = f in filas_res
+        d.text((margen_izq - 34, y + n * alto_caja / 2), f"Fila {f}", font=f_txt_b if en_res else f_txt, fill=ROJO if en_res else (40, 40, 40), anchor="rm")
+        if f == 0: d.text((margen_izq - 34, y + n * alto_caja / 2 + 16), "sin techo", font=f_peq, fill=(120, 120, 120), anchor="rm")
         for i, c in enumerate(columnas):
             x = margen_izq + i * ancho_celda
             for nivel in range(1, n + 1):
                 top = y + (n - nivel) * alto_caja
                 registros = ocupados.get((f, c, nivel), [])
+                borde_ancho, fuente = 2, f_txt
                 if not registros:
                     clave = "libre"
                     texto = f"N{nivel} (extra)" if (f > 0 and nivel > NIVELES_NORMALES) else f"N{nivel}"
                     if f > 0 and nivel <= NIVELES_NORMALES: libres += 1
-                elif len(registros) > 1:
-                    clave, texto = "conflicto", f"! {len(registros)} paquetes"; conflictos += 1
+                    fuente = f_peq
                 else:
-                    clave, texto = "ocupado", registros[0]; ocupados_n += 1
+                    if len(registros) > 1: clave, texto = "conflicto", f"! {len(registros)} paquetes"; conflictos += 1
+                    else: clave, texto = "ocupado", registros[0]; ocupados_n += 1
+                    if (f, c, nivel) in resaltar:
+                        clave, borde_ancho, fuente = "resaltado", 4, f_txt_b; marcados += 1
+                        yc = top + alto_caja / 2
+                        d.polygon([(margen_izq - 26, yc - 10), (margen_izq - 26, yc + 10), (margen_izq - 6, yc)], fill=ROJO)
                 relleno, borde = colores[clave]
-                d.rectangle([x + 3, top + 2, x + ancho_celda - 3, top + alto_caja - 2], fill=relleno, outline=borde, width=2)
-                d.text((x + ancho_celda / 2, top + alto_caja / 2), texto, font=f_txt if clave != "libre" else f_peq,
+                d.rectangle([x + 3, top + 2, x + ancho_celda - 3, top + alto_caja - 2], fill=relleno, outline=borde, width=borde_ancho)
+                d.text((x + ancho_celda / 2, top + alto_caja / 2), texto, font=fuente,
                        fill=(30, 30, 30) if clave != "libre" else (90, 140, 95), anchor="mm")
         y += n * alto_caja + espacio
     d.text((margen_izq, 14), f"Estantería {est} · {nombre_area}", font=f_tit, fill=(20, 20, 20))
     total_ocup = ocupados_n + conflictos
     d.text((margen_izq, 46), f"{total_ocup} nivel(es) ocupado(s) · {libres} libre(s) hasta el nivel {NIVELES_NORMALES} (sin contar la fila 0)", font=f_sub, fill=(70, 70, 70))
+    leyenda = [("libre", "Libre"), ("ocupado", "Ocupado"), ("conflicto", "Ocupado 2+ veces")]
+    if resaltar: leyenda.append(("resaltado", "Resultado de la búsqueda"))
     ly = y + 14
-    for j, (clave, nombre) in enumerate((("libre", "Libre"), ("ocupado", "Ocupado"), ("conflicto", "Ocupado 2+ veces"))):
+    for j, (clave, nombre) in enumerate(leyenda):
         lx = margen_izq + j * 150
         relleno, borde = colores[clave]
-        d.rectangle([lx, ly, lx + 18, ly + 18], fill=relleno, outline=borde, width=2)
+        d.rectangle([lx, ly, lx + 18, ly + 18], fill=relleno, outline=borde, width=3 if clave == "resaltado" else 2)
         d.text((lx + 26, ly + 9), nombre, font=f_peq, fill=(60, 60, 60), anchor="lm")
     buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
-    return buf, {"ocupados": total_ocup, "libres": libres, "conflictos": conflictos, "sin_ubicar": sin_ubicar}
+    return buf, {"ocupados": total_ocup, "libres": libres, "conflictos": conflictos, "sin_ubicar": sin_ubicar, "marcados": marcados}
+
+async def enviar_mapas_resultado(mensaje, area, paquetes, max_mapas=3):
+    """Después de una búsqueda: envía el dibujo de la estantería con el/los paquete(s) encontrado(s) resaltado(s).
+    Nunca interrumpe la búsqueda si algo falla."""
+    try:
+        paquetes = [p for p in (paquetes or []) if p]
+        grupos = {}
+        for r in paquetes:
+            grupos.setdefault(str(r.get("estanteria")).strip(), []).append(r)
+        for i, (est, rs) in enumerate(grupos.items()):
+            if i >= max_mapas:
+                await mensaje.reply_text(f"ℹ️ Los resultados están en {len(grupos)} estanterías; te mostré las primeras {max_mapas}. Usa 🗄️ MAPA DE ESTANTERÍAS para ver las demás.")
+                break
+            resaltar, lineas = set(), []
+            for r in rs:
+                f, c, p = str(r.get("fila")).strip(), str(r.get("columna")).strip().upper(), str(r.get("pila")).strip()
+                if f.isdigit() and p.isdigit() and len(c) == 1: resaltar.add((int(f), c, int(p)))
+                desc = (f"N° {r.get('num_paquete')} ({r.get('usuario_codigo')})" if area == "E"
+                        else f"{r.get('tipo_evento')} {r.get('anio')} · Paq {r.get('num_paquete')}")
+                lineas.append(f"📍 {desc} → E{est}-F{f}-{c}-P{p}")
+            if not resaltar: continue
+            buf, resumen = await asyncio.to_thread(generar_mapa_estanteria, area, est, resaltar)
+            if buf is None: continue
+            caption = "\n".join(lineas[:12]) + (f"\n… y {len(lineas) - 12} más" if len(lineas) > 12 else "")
+            await mensaje.reply_photo(photo=buf, caption=caption[:1000])
+    except Exception:
+        traceback.print_exc()
 
 def teclado_areas_mapa():
     return InlineKeyboardMarkup([
@@ -2564,7 +2620,7 @@ def _estado_existente():
 def parsear_carga(texto, usuario):
     """Devuelve (validos, errores, avisos). errores/avisos = [(n° de línea, texto)]."""
     ex = _estado_existente()
-    validos, errores, avisos = [], [], []
+    validos, errores, avisos, reasignables = [], [], [], []
     vistos = {"paq": set(), "gen_e": set(), "ubic_e": set(), "ev": set(), "gen_v": set(), "ubic_v": set()}
     for nro, cruda in enumerate(texto.splitlines(), start=1):
         linea = cruda.strip().lstrip("\ufeff")
@@ -2572,6 +2628,7 @@ def parsear_carga(texto, usuario):
         partes = [p.strip() for p in re.split(r"[;|\t]", linea)]
         if len(partes) == 1: partes = [p.strip() for p in linea.split(",")]
         t = partes[0].upper()
+        gen_repetido = None
         def entero(valor, nombre):
             if not re.fullmatch(r"\d+", valor or ""): raise ValueError(f"{nombre} debe ser un número")
             return int(valor)
@@ -2594,8 +2651,9 @@ def parsear_carga(texto, usuario):
                 elif gen_txt.lower() in ("blanco", "null"): gen = None
                 else:
                     gen = entero(gen_txt, "el N° General")
-                    if gen in ex["gen_e"] or gen in vistos["gen_e"]: raise ValueError(f"el N° General {gen} ya está en uso")
-                    vistos["gen_e"].add(gen)
+                    if gen in ex["gen_e"] or gen in vistos["gen_e"]:
+                        gen_repetido, gen = gen, "auto"
+                    else: vistos["gen_e"].add(gen)
                 clave = (dpi.lower(), paq)
                 if clave in ex["paq"]: raise ValueError(f"el paquete {paq} de {dpi} ya existe en el sistema")
                 if clave in vistos["paq"]: raise ValueError(f"el paquete {paq} de {dpi} está repetido en el archivo")
@@ -2604,7 +2662,7 @@ def parsear_carga(texto, usuario):
                 if ubic in ex["ubic_e"] or ubic in vistos["ubic_e"]:
                     avisos.append((nro, f"la ubicación E{est}-F{fila}-{col}-P{pila} ya está ocupada"))
                 vistos["ubic_e"].add(ubic)
-                validos.append({"nro": nro, "tipo": "E", "dpi": dpi, "del": f_del, "al": f_al, "paq": paq, "est": est, "fila": str(fila), "col": col, "pila": str(pila), "gen": gen})
+                (validos if gen_repetido is None else reasignables).append({"gen_rep": gen_repetido, "nro": nro, "tipo": "E", "dpi": dpi, "del": f_del, "al": f_al, "paq": paq, "est": est, "fila": str(fila), "col": col, "pila": str(pila), "gen": gen})
             elif t == "V":
                 if len(partes) < 10: raise ValueError("faltan datos (se esperan 10 u 11 campos)")
                 tipo_txt, anio, paq, ini, fin, est, fila, col, pila = partes[1:10]
@@ -2622,8 +2680,9 @@ def parsear_carga(texto, usuario):
                 elif gen_txt.lower() in ("blanco", "null"): gen = None
                 else:
                     gen = entero(gen_txt, "el N° General")
-                    if gen in ex["gen_v"] or gen in vistos["gen_v"]: raise ValueError(f"el N° General {gen} ya está en uso")
-                    vistos["gen_v"].add(gen)
+                    if gen in ex["gen_v"] or gen in vistos["gen_v"]:
+                        gen_repetido, gen = gen, "auto"
+                    else: vistos["gen_v"].add(gen)
                 clave = (tipo, anio, paq)
                 if clave in ex["ev"]: raise ValueError(f"el paquete {paq} de {tipo} {anio} ya existe en el sistema")
                 if clave in vistos["ev"]: raise ValueError(f"el paquete {paq} de {tipo} {anio} está repetido en el archivo")
@@ -2632,21 +2691,21 @@ def parsear_carga(texto, usuario):
                 if ubic in ex["ubic_v"] or ubic in vistos["ubic_v"]:
                     avisos.append((nro, f"la ubicación E{est}-F{fila}-{col}-P{pila} ya está ocupada"))
                 vistos["ubic_v"].add(ubic)
-                validos.append({"nro": nro, "tipo": "V", "evento": tipo, "anio": anio, "paq": paq, "ini": ini, "fin": fin, "est": est, "fila": str(fila), "col": col, "pila": str(pila), "gen": gen})
+                (validos if gen_repetido is None else reasignables).append({"gen_rep": gen_repetido, "nro": nro, "tipo": "V", "evento": tipo, "anio": anio, "paq": paq, "ini": ini, "fin": fin, "est": est, "fila": str(fila), "col": col, "pila": str(pila), "gen": gen})
             else:
                 raise ValueError("la línea debe empezar con E (DPI) o V (eventos)")
         except ValueError as e:
             errores.append((nro, str(e)))
-    return validos, errores, avisos
+    return validos, errores, avisos, reasignables
 
 def ejecutar_carga(validos, usuario):
     """Inserta cada línea válida. Devuelve (cargados, fallos [(n° de línea, motivo)])."""
-    ok, fallos = 0, []
+    ok, fallos, asignados = 0, [], []
     for it in validos:
         try:
             if it["tipo"] == "E":
                 general = "auto" if it["gen"] == "auto" else ("blanco" if it["gen"] is None else str(it["gen"]))
-                _, error = insertar_paquete(it["dpi"], it["paq"], it["del"], it["al"], it["est"], it["fila"], it["col"], it["pila"], general)
+                nuevo_gen, error = insertar_paquete(it["dpi"], it["paq"], it["del"], it["al"], it["est"], it["fila"], it["col"], it["pila"], general)
             else:
                 if it["gen"] == "auto": general = str(siguiente_general())
                 elif it["gen"] is None: general = "blanco"
@@ -2654,13 +2713,16 @@ def ejecutar_carga(validos, usuario):
                 exito, error = insertar_evento(it["evento"], it["anio"], it["paq"], it["ini"], it["fin"], general, it["est"], it["fila"], it["col"], it["pila"], usuario["dpi_asignado"] or usuario["nombre"])
                 if exito: error = None
             if error: fallos.append((it["nro"], error))
-            else: ok += 1
+            else:
+                ok += 1
+                if it["gen"] == "auto":
+                    asignados.append((it["nro"], nuevo_gen if it["tipo"] == "E" else int(general), it.get("gen_rep")))
         except Exception as e:
             traceback.print_exc()
             fallos.append((it["nro"], f"{type(e).__name__}: {e}"))
     if ok or fallos:
         bitacora("CARGA MASIVA", "paquetes", f"{ok} registro(s) cargados, {len(fallos)} con error")
-    return ok, fallos
+    return ok, fallos, asignados
 
 async def cargar_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
@@ -2689,18 +2751,23 @@ async def cargar_recibir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len([l for l in texto.splitlines() if l.strip()]) > MAX_LINEAS_CARGA:
         await mensaje.reply_text(f"⚠️ Máximo {MAX_LINEAS_CARGA} líneas por carga. Divide el archivo e inténtalo de nuevo:"); return CG_DATOS
     aviso = await mensaje.reply_text("⏳ Revisando los registros...")
-    validos, errores, avisos = await asyncio.to_thread(parsear_carga, texto, usuario)
-    context.user_data["cg_validos"] = validos
+    validos, errores, avisos, reasignables = await asyncio.to_thread(parsear_carga, texto, usuario)
+    context.user_data["cg_validos"], context.user_data["cg_reasignables"] = validos, reasignables
     n_e = sum(1 for v in validos if v["tipo"] == "E"); n_v = len(validos) - n_e
-    lineas = [f"📥 Revisión de la carga\n\n✅ Válidas: {len(validos)} (DPI: {n_e}, Eventos: {n_v})\n❌ Con error: {len(errores)}\n⚠️ Avisos: {len(avisos)}"]
+    lineas = [f"📥 Revisión de la carga\n\n✅ Válidas: {len(validos)} (DPI: {n_e}, Eventos: {n_v})\n🔁 Con N° General repetido: {len(reasignables)}\n❌ Con error: {len(errores)}\n⚠️ Avisos: {len(avisos)}"]
+    if reasignables:
+        lineas.append("N° General repetido (no se cargan con el botón normal; puedes asignarles uno automático):\n" + "\n".join(f"• Línea {it['nro']}: el N° General {it['gen_rep']} ya está en uso" for it in reasignables[:15]) + (f"\n… y {len(reasignables) - 15} más" if len(reasignables) > 15 else ""))
     if errores:
         lineas.append("Errores (no se cargarán):\n" + "\n".join(f"• Línea {n}: {m}" for n, m in errores[:15]) + (f"\n… y {len(errores) - 15} más" if len(errores) > 15 else ""))
     if avisos:
         lineas.append("Avisos (se cargarán igual):\n" + "\n".join(f"• Línea {n}: {m}" for n, m in avisos[:10]) + (f"\n… y {len(avisos) - 10} más" if len(avisos) > 10 else ""))
     texto_revision = "\n\n".join(lineas)
-    if validos:
-        teclado = InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Cargar {len(validos)} registro(s)", callback_data="cg_si")],
-                                        [InlineKeyboardButton("🔙 Cancelar", callback_data="menu_inicio")]])
+    if validos or reasignables:
+        filas_botones = []
+        if validos: filas_botones.append([InlineKeyboardButton(f"✅ Cargar {len(validos)} registro(s)", callback_data="cg_si")])
+        if reasignables: filas_botones.append([InlineKeyboardButton(f"🔁 Cargar {len(validos) + len(reasignables)} (asignando N° General automático a los repetidos)", callback_data="cg_auto")])
+        filas_botones.append([InlineKeyboardButton("🔙 Cancelar", callback_data="menu_inicio")])
+        teclado = InlineKeyboardMarkup(filas_botones)
         texto_revision += "\n\nPuedes enviar un texto corregido para repetir la revisión, o confirmar."
         estado = CG_CONFIRMAR
     else:
@@ -2717,17 +2784,22 @@ async def cargar_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
     if not usuario: return ConversationHandler.END
-    validos = context.user_data.get("cg_validos") or []
+    validos = list(context.user_data.get("cg_validos") or [])
+    if query.data == "cg_auto": validos += list(context.user_data.get("cg_reasignables") or [])
+    validos.sort(key=lambda it: it["nro"])
     btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
     if not validos:
         await query.edit_message_text("No hay registros para cargar.", reply_markup=btn_volver); return ConversationHandler.END
     await query.edit_message_text(f"⏳ Cargando {len(validos)} registro(s)...")
-    ok, fallos = await asyncio.to_thread(ejecutar_carga, validos, usuario)
+    ok, fallos, asignados = await asyncio.to_thread(ejecutar_carga, validos, usuario)
     texto = f"{'✅' if not fallos else '⚠️'} Carga terminada: {ok} de {len(validos)} registro(s) guardados."
     if fallos:
         texto += "\n\nNo se guardaron:\n" + "\n".join(f"• Línea {n}: {m}" for n, m in fallos[:15])
     else:
         texto += "\n\nYa puedes vaciar la lista en el formulario sin internet."
+    if asignados:
+        texto += "\n\n🔢 N° General asignados automáticamente:\n" + "\n".join(
+            f"• Línea {n} → {g}" + (f" (el {rep} estaba repetido)" if rep else "") for n, g, rep in asignados[:20]) + (f"\n… y {len(asignados) - 20} más" if len(asignados) > 20 else "")
     await query.edit_message_text(texto, reply_markup=btn_volver)
     context.user_data.clear()
     return ConversationHandler.END
@@ -2972,8 +3044,9 @@ function linea(it) {
 }
 function sugerirSiguiente(tipo, d) {
   const u = siguienteUbic(d);
-  if (tipo === 'E') return { usuario: d.usuario, paq: String((parseInt(d.paq, 10) || 0) + 1), est: u.est, fila: u.fila, col: u.col, pila: u.pila };
-  return { tipo: d.tipo, anio: d.anio, paq: String((parseInt(d.paq, 10) || 0) + 1), ini: String((parseInt(d.fin, 10) || 0) + 1), est: u.est, fila: u.fila, col: u.col, pila: u.pila };
+  const gen = /^\d+$/.test(String(d.gen || '').trim()) ? String(parseInt(d.gen, 10) + 1) : '';
+  if (tipo === 'E') return { usuario: d.usuario, paq: String((parseInt(d.paq, 10) || 0) + 1), est: u.est, fila: u.fila, col: u.col, pila: u.pila, gen: gen };
+  return { tipo: d.tipo, anio: d.anio, paq: String((parseInt(d.paq, 10) || 0) + 1), ini: String((parseInt(d.fin, 10) || 0) + 1), est: u.est, fila: u.fila, col: u.col, pila: u.pila, gen: gen };
 }
 function validar(tipo, d) {
   const entero = (v) => /^\d+$/.test(String(v || '').trim());
@@ -3020,7 +3093,7 @@ const CAMPOS = {
   E: [
     { id: 'usuario', et: 'Usuario (DPI o código)', t: 'text' },
     { id: 'del', et: 'Fecha DEL', t: 'date', mitad: true }, { id: 'al', et: 'Fecha AL', t: 'date', mitad: true },
-    { id: 'paq', et: 'N° de paquete', t: 'number', mitad: true }, { id: 'gen', et: 'N° General (vacío = automático)', t: 'number', mitad: true },
+    { id: 'paq', et: 'N° de paquete', t: 'number', mitad: true }, { id: 'gen', et: 'N° General (vacío = lo asigna el bot)', t: 'number', mitad: true, ph: 'automático' },
     { id: 'est', et: 'Estantería', t: 'text', mitad: true }, { id: 'fila', et: 'Fila', t: 'number', mitad: true },
     { id: 'col', et: 'Columna', t: 'select', op: ['A', 'B', 'C', 'D', 'E', 'F'], mitad: true }, { id: 'pila', et: 'Pila / nivel', t: 'number', mitad: true }
   ],
@@ -3028,7 +3101,7 @@ const CAMPOS = {
     { id: 'tipo', et: 'Tipo de evento', t: 'select', op: ['Nacimiento', 'Matrimonio', 'Defuncion', 'Divorcio', 'Negativa'] },
     { id: 'anio', et: 'Año', t: 'number', mitad: true }, { id: 'paq', et: 'N° de paquete', t: 'number', mitad: true },
     { id: 'ini', et: 'Evento DEL', t: 'number', mitad: true }, { id: 'fin', et: 'Evento AL', t: 'number', mitad: true },
-    { id: 'gen', et: 'N° General (vacío = automático)', t: 'number' },
+    { id: 'gen', et: 'N° General (vacío = lo asigna el bot)', t: 'number', ph: 'automático' },
     { id: 'est', et: 'Estantería', t: 'text', mitad: true }, { id: 'fila', et: 'Fila', t: 'number', mitad: true },
     { id: 'col', et: 'Columna', t: 'select', op: ['A', 'B', 'C', 'D', 'E', 'F'], mitad: true }, { id: 'pila', et: 'Pila / nivel', t: 'number', mitad: true }
   ]
@@ -3053,7 +3126,7 @@ function dibujarForm() {
     const v = b[c.id] !== undefined ? b[c.id] : '';
     let campo;
     if (c.t === 'select') campo = '<select id="c_' + c.id + '">' + c.op.map((o) => '<option' + (o === v ? ' selected' : '') + '>' + o + '</option>').join('') + '</select>';
-    else campo = '<input id="c_' + c.id + '" type="' + c.t + '"' + (c.t === 'number' ? ' inputmode="numeric" min="0"' : '') + ' value="' + String(v).replace(/"/g, '&quot;') + '" autocomplete="off">';
+    else campo = '<input id="c_' + c.id + '" type="' + c.t + '"' + (c.t === 'number' ? ' inputmode="numeric" min="0"' : '') + (c.ph ? ' placeholder="' + c.ph + '"' : '') + ' value="' + String(v).replace(/"/g, '&quot;') + '" autocomplete="off">';
     html += '<div><label for="c_' + c.id + '">' + c.et + '</label>' + campo + '</div>';
   });
   if (abierto) html += '</div>';
@@ -3078,23 +3151,29 @@ function dibujarLista() {
   $('n').textContent = items.length;
   const seleccionadas = items.filter((it) => it.sel !== false).length;
   $('imprimirSel').textContent = '🏷️ Imprimir etiquetas seleccionadas (' + seleccionadas + ')';
-  const claves = {}, ubics = {};
-  items.forEach((it) => { claves[claveItem(it)] = (claves[claveItem(it)] || 0) + 1; ubics[claveUbic(it)] = (ubics[claveUbic(it)] || 0) + 1; });
+  const claves = {}, ubics = {}, gens = {};
+  const claveGen = (it) => (String(it.datos.gen || '').trim() ? it.tipo + '|' + parseInt(it.datos.gen, 10) : '');
+  items.forEach((it) => { claves[claveItem(it)] = (claves[claveItem(it)] || 0) + 1; ubics[claveUbic(it)] = (ubics[claveUbic(it)] || 0) + 1; if (claveGen(it)) gens[claveGen(it)] = (gens[claveGen(it)] || 0) + 1; });
   $('lista').innerHTML = items.length ? '' : '<p class="nota">Aún no hay registros pendientes.</p>';
   items.forEach((it, i) => {
     const d = it.datos, av = [];
     if (claves[claveItem(it)] > 1) av.push('⚠️ Paquete repetido en la lista');
     if (ubics[claveUbic(it)] > 1) av.push('⚠️ Misma ubicación que otro pendiente');
+    if (claveGen(it) && gens[claveGen(it)] > 1) av.push('⚠️ N° General repetido en la lista');
     const titulo = it.tipo === 'E' ? '👤 ' + d.usuario + ' · Paq ' + d.paq : '📖 ' + d.tipo + ' ' + d.anio + ' · Paq ' + d.paq;
     const detalle = it.tipo === 'E' ? d.del + ' → ' + d.al : 'Eventos ' + d.ini + '-' + d.fin;
     const div = document.createElement('div'); div.className = 'card item';
-    div.innerHTML = '<input type="checkbox" data-s="' + i + '"' + (it.sel !== false ? ' checked' : '') + ' aria-label="Incluir en la impresión"><div class="cuerpo"><b>' + esc(titulo) + '</b><small>' + esc(detalle) + ' · E' + esc(d.est) + '-F' + esc(d.fila) + '-' + esc(d.col) + '-P' + esc(d.pila) + (d.gen ? ' · Gen ' + esc(d.gen) : '') + '</small>' + av.map((a) => '<span class="aviso">' + a + '</span>').join('<br>') + '</div><div class="acc"><button data-p="' + i + '" title="Imprimir etiqueta">🏷️</button><button data-e="' + i + '">✏️</button><button data-b="' + i + '">🗑️</button></div>';
+    div.innerHTML = '<input type="checkbox" data-s="' + i + '"' + (it.sel !== false ? ' checked' : '') + ' aria-label="Incluir en la impresión"><div class="cuerpo"><b>' + esc(titulo) + '</b><small>' + esc(detalle) + ' · E' + esc(d.est) + '-F' + esc(d.fila) + '-' + esc(d.col) + '-P' + esc(d.pila) + (d.gen ? ' · Gen ' + esc(d.gen) : ' · Gen automático') + '</small>' + av.map((a) => '<span class="aviso">' + a + '</span>').join('<br>') + '</div><div class="acc"><button data-p="' + i + '" title="Imprimir etiqueta">🏷️</button><button data-e="' + i + '">✏️</button><button data-b="' + i + '">🗑️</button></div>';
     $('lista').appendChild(div);
   });
 }
 function agregar() {
   const d = leerForm(), err = validar(tipo, d);
   if (err) { mostrarError(err); return; }
+  if (String(d.gen || '').trim()) {
+    const otro = items.findIndex((it, i) => i !== editando && it.tipo === tipo && String(it.datos.gen || '').trim() !== '' && parseInt(it.datos.gen, 10) === parseInt(d.gen, 10));
+    if (otro >= 0) { mostrarError('El N° General ' + d.gen + ' ya lo usaste en otro pendiente (Paq ' + items[otro].datos.paq + '). Cambia el número o déjalo vacío para que lo asigne el bot.'); return; }
+  }
   mostrarError(''); msg('');
   let indice;
   if (editando !== null) { items[editando] = { tipo, datos: d, ts: items[editando].ts, sel: items[editando].sel }; indice = editando; editando = null; }
@@ -3221,7 +3300,7 @@ if __name__ == "__main__":
         entry_points=[CommandHandler("cargar", cargar_inicio), CallbackQueryHandler(cargar_inicio, pattern="^accion_cargar$")],
         states={
             CG_DATOS: [MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.Document.ALL, cargar_recibir)],
-            CG_CONFIRMAR: [CallbackQueryHandler(cargar_confirmar, pattern="^cg_si$"),
+            CG_CONFIRMAR: [CallbackQueryHandler(cargar_confirmar, pattern="^cg_(si|auto)$"),
                            MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.Document.ALL, cargar_recibir)],
         },
         fallbacks=[CommandHandler("cancelar", cancelar), CallbackQueryHandler(cancelar_a_menu, pattern="^menu_inicio$")],
