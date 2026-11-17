@@ -2582,8 +2582,13 @@ async def mapa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🗄️ {AREAS_MAPA[area][1]}\n\nElige la estantería:" if est else f"🗄️ {AREAS_MAPA[area][1]}: aún no hay paquetes con ubicación registrados.", reply_markup=teclado); return
     await update.message.reply_text("🗄️ MAPA DE ESTANTERÍAS\n\n¿De qué área quieres ver la estantería?\n(También: /mapa dpi 5  o  /mapa eventos 5)", reply_markup=teclado_areas_mapa())
 
-# --- CARGA MASIVA: sube los registros guardados sin internet ---
+# --- CARGA MASIVA: sube los registros guardados sin internet (y corrige los que ya existen) ---
 MAX_LINEAS_CARGA = 300
+
+# Campos que la carga masiva PUEDE actualizar en un paquete que ya existe. La clave del paquete (usuario/tipo-año y N° de paquete)
+# y el N° General NO se modifican por esta vía (el N° General es el que ya está en las etiquetas; se cambia solo con Editar).
+CAMPOS_ACT_E = (("fecha_del", "DEL"), ("fecha_al", "AL"), ("estanteria", "estantería"), ("fila", "fila"), ("columna", "columna"), ("pila", "pila"))
+CAMPOS_ACT_V = (("folio_inicio", "DEL"), ("folio_fin", "AL"), ("estanteria", "estantería"), ("fila", "fila"), ("columna", "columna"), ("pila", "pila"))
 
 def url_offline():
     base = os.environ.get("RENDER_EXTERNAL_URL", "https://bot-atestados.onrender.com").rstrip("/")
@@ -2596,32 +2601,56 @@ def texto_ayuda_carga():
             "Eventos:\nV;tipo;año;paquete;DEL;AL;estantería;fila;columna;pila;general\n\n"
             "• Las fechas pueden ir como AAAA-MM-DD o DD/MM/AAAA.\n"
             "• El N° General vacío se asigna solo, en orden correlativo.\n"
+            "• Si un paquete ya existe y la línea trae datos distintos (fechas, rango DEL-AL o ubicación), te propongo ACTUALIZARLO. El N° General nunca se modifica por aquí.\n"
             "• Antes de guardar te muestro una revisión y confirmas.\n\n"
             f"Formulario para registrar sin internet (ábrelo una vez con internet y quedará disponible):\n{url_offline()}\n\n"
             "(/cancelar para salir)")
 
+def _i(x):
+    try: return int(x)
+    except Exception: return x
+
+def _norm(campo, v):
+    if v is None: return ""
+    v = str(v).strip()
+    if campo in ("fila", "pila", "folio_inicio", "folio_fin") and v.isdigit(): return str(int(v))
+    if campo == "columna": return v.upper()
+    return v
+
+def _cambios(actual, nuevo, campos):
+    """Lista [(campo, nombre, valor_actual, valor_nuevo)] de lo que cambia."""
+    out = []
+    for campo, nombre in campos:
+        a, n = _norm(campo, actual.get(campo)), _norm(campo, nuevo.get(campo))
+        if a != n: out.append((campo, nombre, a, n))
+    return out
+
+def _texto_cambios(cambios):
+    return "; ".join(f"{nombre} {a or '—'} → {n}" for _, nombre, a, n in cambios)
+
 def _estado_existente():
     """Carga de una vez lo que ya existe, para validar sin hacer una consulta por línea."""
     client = conectar_db()
-    ex = {"paq": set(), "gen_e": set(), "ubic_e": set(), "ev": set(), "gen_v": set(), "ubic_v": set()}
-    def _i(x):
-        try: return int(x)
-        except Exception: return x
-    for r in client.execute("SELECT usuario_codigo, num_paquete, numero_general, estanteria, fila, columna, pila FROM paquetes").rows:
-        ex["paq"].add((str(r[0]).strip().lower(), _i(r[1])))
+    ex = {"paq": {}, "gen_e": set(), "ubic_e": set(), "ev": {}, "gen_v": set(), "ubic_v": set()}
+    for r in client.execute("SELECT usuario_codigo, num_paquete, numero_general, estanteria, fila, columna, pila, fecha_del, fecha_al FROM paquetes").rows:
+        ex["paq"][(str(r[0]).strip().lower(), _i(r[1]))] = {"dpi": str(r[0]).strip(), "numero_general": r[2], "estanteria": r[3], "fila": r[4], "columna": r[5], "pila": r[6], "fecha_del": r[7], "fecha_al": r[8]}
         if r[2] is not None: ex["gen_e"].add(_i(r[2]))
         ex["ubic_e"].add((str(r[3]).strip(), _i(r[4]), str(r[5]).strip().upper(), _i(r[6])))
-    for r in client.execute("SELECT tipo_evento, anio, num_paquete, numero_general, estanteria, fila, columna, pila FROM eventos").rows:
-        ex["ev"].add((str(r[0]), _i(r[1]), _i(r[2])))
+    for r in client.execute("SELECT tipo_evento, anio, num_paquete, numero_general, estanteria, fila, columna, pila, folio_inicio, folio_fin FROM eventos").rows:
+        ex["ev"][(str(r[0]), _i(r[1]), _i(r[2]))] = {"numero_general": r[3], "estanteria": r[4], "fila": r[5], "columna": r[6], "pila": r[7], "folio_inicio": r[8], "folio_fin": r[9]}
         if r[3] is not None: ex["gen_v"].add(_i(r[3]))
         ex["ubic_v"].add((str(r[4]).strip(), _i(r[5]), str(r[6]).strip().upper(), _i(r[7])))
     return ex
 
 def parsear_carga(texto, usuario):
-    """Devuelve (validos, errores, avisos). errores/avisos = [(n° de línea, texto)]."""
+    """Devuelve (validos, errores, avisos, reasignables, actualizables, sin_cambios).
+    validos = paquetes nuevos; reasignables = nuevos con N° General repetido; actualizables = ya existen y cambian algo."""
     ex = _estado_existente()
-    validos, errores, avisos, reasignables = [], [], [], []
+    validos, errores, avisos, reasignables, actualizables, sin_cambios = [], [], [], [], [], []
     vistos = {"paq": set(), "gen_e": set(), "ubic_e": set(), "ev": set(), "gen_v": set(), "ubic_v": set()}
+    def entero(valor, nombre):
+        if not re.fullmatch(r"\d+", valor or ""): raise ValueError(f"{nombre} debe ser un número")
+        return int(valor)
     for nro, cruda in enumerate(texto.splitlines(), start=1):
         linea = cruda.strip().lstrip("\ufeff")
         if not linea or linea.startswith("#"): continue
@@ -2629,9 +2658,6 @@ def parsear_carga(texto, usuario):
         if len(partes) == 1: partes = [p.strip() for p in linea.split(",")]
         t = partes[0].upper()
         gen_repetido = None
-        def entero(valor, nombre):
-            if not re.fullmatch(r"\d+", valor or ""): raise ValueError(f"{nombre} debe ser un número")
-            return int(valor)
         try:
             if t == "E":
                 if len(partes) < 9: raise ValueError("faltan datos (se esperan 9 o 10 campos)")
@@ -2647,6 +2673,24 @@ def parsear_carga(texto, usuario):
                 col = col.upper()
                 if col not in tuple("ABCDEF"): raise ValueError("la columna debe ser A-F")
                 if not est: raise ValueError("falta la estantería")
+                clave = (dpi.lower(), paq)
+                if clave in vistos["paq"]: raise ValueError(f"el paquete {paq} de {dpi} está repetido en el archivo")
+                vistos["paq"].add(clave)
+                ubic = (est, fila, col, pila)
+                if clave in ex["paq"]:  # ya existe: ¿hay algo que corregir?
+                    actual = ex["paq"][clave]
+                    nuevo = {"fecha_del": f_del, "fecha_al": f_al, "estanteria": est, "fila": str(fila), "columna": col, "pila": str(pila)}
+                    cambios = _cambios(actual, nuevo, CAMPOS_ACT_E)
+                    if not cambios:
+                        sin_cambios.append((nro, f"{dpi} N° {paq} ya está igual")); continue
+                    propia = (str(actual["estanteria"]).strip(), _i(actual["fila"]), str(actual["columna"]).strip().upper(), _i(actual["pila"]))
+                    if ubic != propia and (ubic in ex["ubic_e"] or ubic in vistos["ubic_e"]):
+                        avisos.append((nro, f"la nueva ubicación E{est}-F{fila}-{col}-P{pila} ya está ocupada"))
+                    vistos["ubic_e"].add(ubic)
+                    if gen_txt.isdigit() and actual.get("numero_general") is not None and int(gen_txt) != int(actual["numero_general"]):
+                        avisos.append((nro, f"el N° General no se modifica por aquí (usa Editar si quieres cambiarlo)"))
+                    actualizables.append({"nro": nro, "tipo": "E", "dpi": actual["dpi"], "paq": paq, "cambios": cambios})
+                    continue
                 if gen_txt.lower() in ("", "auto"): gen = "auto"
                 elif gen_txt.lower() in ("blanco", "null"): gen = None
                 else:
@@ -2654,11 +2698,6 @@ def parsear_carga(texto, usuario):
                     if gen in ex["gen_e"] or gen in vistos["gen_e"]:
                         gen_repetido, gen = gen, "auto"
                     else: vistos["gen_e"].add(gen)
-                clave = (dpi.lower(), paq)
-                if clave in ex["paq"]: raise ValueError(f"el paquete {paq} de {dpi} ya existe en el sistema")
-                if clave in vistos["paq"]: raise ValueError(f"el paquete {paq} de {dpi} está repetido en el archivo")
-                vistos["paq"].add(clave)
-                ubic = (est, fila, col, pila)
                 if ubic in ex["ubic_e"] or ubic in vistos["ubic_e"]:
                     avisos.append((nro, f"la ubicación E{est}-F{fila}-{col}-P{pila} ya está ocupada"))
                 vistos["ubic_e"].add(ubic)
@@ -2676,6 +2715,24 @@ def parsear_carga(texto, usuario):
                 col = col.upper()
                 if col not in tuple("ABCDEF"): raise ValueError("la columna debe ser A-F")
                 if not est: raise ValueError("falta la estantería")
+                clave = (tipo, anio, paq)
+                if clave in vistos["ev"]: raise ValueError(f"el paquete {paq} de {tipo} {anio} está repetido en el archivo")
+                vistos["ev"].add(clave)
+                ubic = (est, fila, col, pila)
+                if clave in ex["ev"]:  # ya existe: ¿hay algo que corregir?
+                    actual = ex["ev"][clave]
+                    nuevo = {"folio_inicio": ini, "folio_fin": fin, "estanteria": est, "fila": str(fila), "columna": col, "pila": str(pila)}
+                    cambios = _cambios(actual, nuevo, CAMPOS_ACT_V)
+                    if not cambios:
+                        sin_cambios.append((nro, f"{tipo} {anio} Paq {paq} ya está igual")); continue
+                    propia = (str(actual["estanteria"]).strip(), _i(actual["fila"]), str(actual["columna"]).strip().upper(), _i(actual["pila"]))
+                    if ubic != propia and (ubic in ex["ubic_v"] or ubic in vistos["ubic_v"]):
+                        avisos.append((nro, f"la nueva ubicación E{est}-F{fila}-{col}-P{pila} ya está ocupada"))
+                    vistos["ubic_v"].add(ubic)
+                    if gen_txt.isdigit() and actual.get("numero_general") is not None and int(gen_txt) != int(actual["numero_general"]):
+                        avisos.append((nro, "el N° General no se modifica por aquí (usa Editar si quieres cambiarlo)"))
+                    actualizables.append({"nro": nro, "tipo": "V", "evento": tipo, "anio": anio, "paq": paq, "cambios": cambios})
+                    continue
                 if gen_txt.lower() in ("", "auto"): gen = "auto"
                 elif gen_txt.lower() in ("blanco", "null"): gen = None
                 else:
@@ -2683,11 +2740,6 @@ def parsear_carga(texto, usuario):
                     if gen in ex["gen_v"] or gen in vistos["gen_v"]:
                         gen_repetido, gen = gen, "auto"
                     else: vistos["gen_v"].add(gen)
-                clave = (tipo, anio, paq)
-                if clave in ex["ev"]: raise ValueError(f"el paquete {paq} de {tipo} {anio} ya existe en el sistema")
-                if clave in vistos["ev"]: raise ValueError(f"el paquete {paq} de {tipo} {anio} está repetido en el archivo")
-                vistos["ev"].add(clave)
-                ubic = (est, fila, col, pila)
                 if ubic in ex["ubic_v"] or ubic in vistos["ubic_v"]:
                     avisos.append((nro, f"la ubicación E{est}-F{fila}-{col}-P{pila} ya está ocupada"))
                 vistos["ubic_v"].add(ubic)
@@ -2696,10 +2748,10 @@ def parsear_carga(texto, usuario):
                 raise ValueError("la línea debe empezar con E (DPI) o V (eventos)")
         except ValueError as e:
             errores.append((nro, str(e)))
-    return validos, errores, avisos, reasignables
+    return validos, errores, avisos, reasignables, actualizables, sin_cambios
 
 def ejecutar_carga(validos, usuario):
-    """Inserta cada línea válida. Devuelve (cargados, fallos [(n° de línea, motivo)])."""
+    """Inserta cada línea nueva. Devuelve (cargados, fallos [(n° de línea, motivo)], asignados [(n° de línea, N° General, repetido)])."""
     ok, fallos, asignados = 0, [], []
     for it in validos:
         try:
@@ -2724,6 +2776,41 @@ def ejecutar_carga(validos, usuario):
         bitacora("CARGA MASIVA", "paquetes", f"{ok} registro(s) cargados, {len(fallos)} con error")
     return ok, fallos, asignados
 
+def ejecutar_actualizacion(actualizables, usuario):
+    """Corrige los paquetes que ya existen (solo los campos que cambian). Cada campo queda en la bitácora.
+    Devuelve (actualizados, fallos [(n° de línea, motivo)])."""
+    ok, fallos = 0, []
+    for it in actualizables:
+        try:
+            errores_item = []
+            if it["tipo"] == "E":
+                actual = buscar_por_dpi_y_numero(it["dpi"], it["paq"])
+                if not actual:
+                    fallos.append((it["nro"], "el paquete ya no existe")); continue
+                nuevos = {c: n for c, _, _, n in it["cambios"]}
+                orden = [c for c, _, _, _ in it["cambios"]]
+                # Si la nueva fecha DEL queda después de la fecha AL actual, se cambia primero la AL
+                if "fecha_del" in nuevos and "fecha_al" in nuevos and nuevos["fecha_del"] > (actual.get("fecha_al") or ""):
+                    orden = ["fecha_al"] + [c for c in orden if c != "fecha_al"]
+                for campo in orden:
+                    ok_c, msg, _ = actualizar_paquete_clave(it["dpi"], it["paq"], campo, str(nuevos[campo]))
+                    if not ok_c: errores_item.append(f"{campo}: {msg}")
+            else:
+                filas = buscar_evento_por_tap(it["evento"], it["anio"], it["paq"])
+                if not filas:
+                    fallos.append((it["nro"], "el paquete ya no existe")); continue
+                for campo, _, _, nuevo in it["cambios"]:
+                    ok_c, err = actualizar_evento_id(filas[0]["id"], campo, str(nuevo))
+                    if not ok_c: errores_item.append(f"{campo}: {err}")
+            if errores_item: fallos.append((it["nro"], "; ".join(errores_item)))
+            else: ok += 1
+        except Exception as e:
+            traceback.print_exc()
+            fallos.append((it["nro"], f"{type(e).__name__}: {e}"))
+    if ok or fallos:
+        bitacora("ACTUALIZACIÓN MASIVA", "paquetes", f"{ok} paquete(s) actualizados, {len(fallos)} con error")
+    return ok, fallos
+
 async def cargar_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
     if not usuario: return ConversationHandler.END
@@ -2734,6 +2821,11 @@ async def cargar_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(texto_ayuda_carga())
     return CG_DATOS
+
+def _lista_corta(items, formato, maximo):
+    lineas = [formato(i) for i in items[:maximo]]
+    if len(items) > maximo: lineas.append(f"… y {len(items) - maximo} más")
+    return "\n".join(lineas)
 
 async def cargar_recibir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
@@ -2751,29 +2843,35 @@ async def cargar_recibir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len([l for l in texto.splitlines() if l.strip()]) > MAX_LINEAS_CARGA:
         await mensaje.reply_text(f"⚠️ Máximo {MAX_LINEAS_CARGA} líneas por carga. Divide el archivo e inténtalo de nuevo:"); return CG_DATOS
     aviso = await mensaje.reply_text("⏳ Revisando los registros...")
-    validos, errores, avisos, reasignables = await asyncio.to_thread(parsear_carga, texto, usuario)
-    context.user_data["cg_validos"], context.user_data["cg_reasignables"] = validos, reasignables
+    validos, errores, avisos, reasignables, actualizables, sin_cambios = await asyncio.to_thread(parsear_carga, texto, usuario)
+    context.user_data.update({"cg_validos": validos, "cg_reasignables": reasignables, "cg_actualizables": actualizables})
     n_e = sum(1 for v in validos if v["tipo"] == "E"); n_v = len(validos) - n_e
-    lineas = [f"📥 Revisión de la carga\n\n✅ Válidas: {len(validos)} (DPI: {n_e}, Eventos: {n_v})\n🔁 Con N° General repetido: {len(reasignables)}\n❌ Con error: {len(errores)}\n⚠️ Avisos: {len(avisos)}"]
+    lineas = [f"📥 Revisión de la carga\n\n✅ Nuevos: {len(validos)} (DPI: {n_e}, Eventos: {n_v})\n🔄 Ya existen y cambian: {len(actualizables)}\n⏸️ Ya existen y están iguales: {len(sin_cambios)}\n🔁 Con N° General repetido: {len(reasignables)}\n❌ Con error: {len(errores)}\n⚠️ Avisos: {len(avisos)}"]
+    if actualizables:
+        def f_act(it):
+            ref = f"{it['dpi']} N° {it['paq']}" if it["tipo"] == "E" else f"{it['evento']} {it['anio']} Paq {it['paq']}"
+            return f"• Línea {it['nro']}: {ref} → {_texto_cambios(it['cambios'])}"
+        lineas.append("Se actualizarían (solo con tu confirmación):\n" + _lista_corta(actualizables, f_act, 15))
     if reasignables:
-        lineas.append("N° General repetido (no se cargan con el botón normal; puedes asignarles uno automático):\n" + "\n".join(f"• Línea {it['nro']}: el N° General {it['gen_rep']} ya está en uso" for it in reasignables[:15]) + (f"\n… y {len(reasignables) - 15} más" if len(reasignables) > 15 else ""))
+        lineas.append("N° General repetido (puedes asignarles uno automático):\n" + _lista_corta(reasignables, lambda it: f"• Línea {it['nro']}: el N° General {it['gen_rep']} ya está en uso", 15))
     if errores:
-        lineas.append("Errores (no se cargarán):\n" + "\n".join(f"• Línea {n}: {m}" for n, m in errores[:15]) + (f"\n… y {len(errores) - 15} más" if len(errores) > 15 else ""))
+        lineas.append("Errores (no se procesarán):\n" + _lista_corta(errores, lambda e: f"• Línea {e[0]}: {e[1]}", 15))
     if avisos:
-        lineas.append("Avisos (se cargarán igual):\n" + "\n".join(f"• Línea {n}: {m}" for n, m in avisos[:10]) + (f"\n… y {len(avisos) - 10} más" if len(avisos) > 10 else ""))
+        lineas.append("Avisos:\n" + _lista_corta(avisos, lambda a: f"• Línea {a[0]}: {a[1]}", 10))
     texto_revision = "\n\n".join(lineas)
-    if validos or reasignables:
-        filas_botones = []
-        if validos: filas_botones.append([InlineKeyboardButton(f"✅ Cargar {len(validos)} registro(s)", callback_data="cg_si")])
-        if reasignables: filas_botones.append([InlineKeyboardButton(f"🔁 Cargar {len(validos) + len(reasignables)} (asignando N° General automático a los repetidos)", callback_data="cg_auto")])
-        filas_botones.append([InlineKeyboardButton("🔙 Cancelar", callback_data="menu_inicio")])
-        teclado = InlineKeyboardMarkup(filas_botones)
-        texto_revision += "\n\nPuedes enviar un texto corregido para repetir la revisión, o confirmar."
+    botones = []
+    if validos: botones.append([InlineKeyboardButton(f"✅ Cargar {len(validos)} nuevo(s)", callback_data="cg_si")])
+    if actualizables: botones.append([InlineKeyboardButton(f"🔄 Solo actualizar {len(actualizables)} existente(s)", callback_data="cg_upd")])
+    if validos and actualizables: botones.append([InlineKeyboardButton(f"📥 Todo: {len(validos)} nuevo(s) + {len(actualizables)} actualización(es)", callback_data="cg_todo")])
+    if reasignables: botones.append([InlineKeyboardButton(f"🔁 Cargar {len(validos) + len(reasignables)} nuevo(s) (N° General automático a los repetidos)", callback_data="cg_auto")])
+    botones.append([InlineKeyboardButton("🔙 Cancelar", callback_data="menu_inicio")])
+    if validos or reasignables or actualizables:
+        texto_revision += "\n\nPuedes enviar un texto corregido para repetir la revisión, o elegir una opción."
         estado = CG_CONFIRMAR
     else:
-        teclado = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancelar", callback_data="menu_inicio")]])
-        texto_revision += "\n\nNo hay líneas válidas. Corrige y vuelve a enviar el texto."
+        texto_revision += "\n\nNo hay nada que cargar ni actualizar. Corrige y vuelve a enviar el texto."
         estado = CG_DATOS
+    teclado = InlineKeyboardMarkup(botones)
     bloques = _bloques_texto("", [texto_revision])
     await aviso.edit_text(bloques[0].strip(), reply_markup=teclado if len(bloques) == 1 else None)
     for i, b in enumerate(bloques[1:], start=1):
@@ -2784,22 +2882,31 @@ async def cargar_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     usuario = await verificar_acceso(update, ["admin", "operador1", "operador2"])
     if not usuario: return ConversationHandler.END
-    validos = list(context.user_data.get("cg_validos") or [])
-    if query.data == "cg_auto": validos += list(context.user_data.get("cg_reasignables") or [])
-    validos.sort(key=lambda it: it["nro"])
+    accion = query.data
+    nuevos = list(context.user_data.get("cg_validos") or [])
+    actualizar = list(context.user_data.get("cg_actualizables") or [])
+    if accion == "cg_auto": nuevos += list(context.user_data.get("cg_reasignables") or [])
+    if accion == "cg_upd": nuevos = []
+    if accion in ("cg_si", "cg_auto"): actualizar = []
+    nuevos.sort(key=lambda it: it["nro"]); actualizar.sort(key=lambda it: it["nro"])
     btn_volver = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
-    if not validos:
+    if not nuevos and not actualizar:
         await query.edit_message_text("No hay registros para cargar.", reply_markup=btn_volver); return ConversationHandler.END
-    await query.edit_message_text(f"⏳ Cargando {len(validos)} registro(s)...")
-    ok, fallos, asignados = await asyncio.to_thread(ejecutar_carga, validos, usuario)
-    texto = f"{'✅' if not fallos else '⚠️'} Carga terminada: {ok} de {len(validos)} registro(s) guardados."
-    if fallos:
-        texto += "\n\nNo se guardaron:\n" + "\n".join(f"• Línea {n}: {m}" for n, m in fallos[:15])
-    else:
-        texto += "\n\nYa puedes vaciar la lista en el formulario sin internet."
-    if asignados:
-        texto += "\n\n🔢 N° General asignados automáticamente:\n" + "\n".join(
-            f"• Línea {n} → {g}" + (f" (el {rep} estaba repetido)" if rep else "") for n, g, rep in asignados[:20]) + (f"\n… y {len(asignados) - 20} más" if len(asignados) > 20 else "")
+    await query.edit_message_text(f"⏳ Procesando {len(nuevos)} nuevo(s) y {len(actualizar)} actualización(es)...")
+    texto, hubo_fallos = "", False
+    if nuevos:
+        ok, fallos, asignados = await asyncio.to_thread(ejecutar_carga, nuevos, usuario)
+        hubo_fallos = hubo_fallos or bool(fallos)
+        texto += f"{'✅' if not fallos else '⚠️'} Nuevos guardados: {ok} de {len(nuevos)}."
+        if fallos: texto += "\nNo se guardaron:\n" + _lista_corta(fallos, lambda e: f"• Línea {e[0]}: {e[1]}", 15)
+        if asignados:
+            texto += "\n\n🔢 N° General asignados automáticamente:\n" + _lista_corta(asignados, lambda a: f"• Línea {a[0]} → {a[1]}" + (f" (el {a[2]} estaba repetido)" if a[2] else ""), 20)
+    if actualizar:
+        ok_u, fallos_u = await asyncio.to_thread(ejecutar_actualizacion, actualizar, usuario)
+        hubo_fallos = hubo_fallos or bool(fallos_u)
+        texto += ("\n\n" if texto else "") + f"{'🔄' if not fallos_u else '⚠️'} Actualizados: {ok_u} de {len(actualizar)}."
+        if fallos_u: texto += "\nNo se actualizaron:\n" + _lista_corta(fallos_u, lambda e: f"• Línea {e[0]}: {e[1]}", 15)
+    if not hubo_fallos: texto += "\n\nYa puedes vaciar la lista en el formulario sin internet."
     await query.edit_message_text(texto, reply_markup=btn_volver)
     context.user_data.clear()
     return ConversationHandler.END
@@ -3018,7 +3125,7 @@ OFFLINE_HTML = r"""<!doctype html>
   <button class="btn sec" id="copiar">📋 Copiar texto</button>
   <button class="btn sec" id="descargar">💾 Descargar archivo</button>
   <div id="msg" class="ok"></div>
-  <p class="nota">En Telegram, abre el bot, usa <b>/cargar</b> y pega el texto (o sube el archivo). Cuando el bot confirme la carga, vuelve aquí y pulsa «Vaciar lista».</p>
+  <p class="nota">En Telegram, abre el bot, usa <b>/cargar</b> y pega el texto (o sube el archivo). Cuando el bot confirme la carga, vuelve aquí y pulsa «Vaciar lista». Si corriges un dato (por ejemplo el nivel) de un paquete que ya subiste, vuelve a enviarlo: el bot te propondrá actualizarlo.</p>
   <button class="btn pel" id="vaciar">🗑️ Vaciar lista (ya enviada)</button>
 </div>
 
@@ -3300,7 +3407,7 @@ if __name__ == "__main__":
         entry_points=[CommandHandler("cargar", cargar_inicio), CallbackQueryHandler(cargar_inicio, pattern="^accion_cargar$")],
         states={
             CG_DATOS: [MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.Document.ALL, cargar_recibir)],
-            CG_CONFIRMAR: [CallbackQueryHandler(cargar_confirmar, pattern="^cg_(si|auto)$"),
+            CG_CONFIRMAR: [CallbackQueryHandler(cargar_confirmar, pattern="^cg_(si|auto|upd|todo)$"),
                            MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.Document.ALL, cargar_recibir)],
         },
         fallbacks=[CommandHandler("cancelar", cancelar), CallbackQueryHandler(cancelar_a_menu, pattern="^menu_inicio$")],
