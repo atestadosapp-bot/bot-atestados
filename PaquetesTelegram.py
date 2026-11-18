@@ -55,6 +55,7 @@ BIT_TEXTO = 52  # Búsqueda en la bitácora
 (LT_MODO, LT_VALOR) = range(53, 55)  # Etiquetas en lote
 EV_UBIC = 55  # Registro de eventos: confirmar ubicación sugerida
 (CG_DATOS, CG_CONFIRMAR) = range(56, 58)  # Carga masiva
+(REG_N5, EV_N5, ES_TEXTO) = range(58, 61)  # Confirmar nivel 5 / definir estructura de estantería
 (EP_MODO, EP_VALOR, EP_ELEGIR, EP_CAMPO, EP_NUEVO, EP_CONFIRMAR) = range(46, 52)  # Buscar / editar / etiqueta / eliminar (enrolamiento)
 
 # ==========================================
@@ -155,6 +156,17 @@ def inicializar_papelera_bitacora():
             accion TEXT,
             entidad TEXT,
             detalle TEXT
+        )""")
+
+def inicializar_estructura():
+    conectar_db().execute("""
+        CREATE TABLE IF NOT EXISTS estanterias (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            area TEXT NOT NULL,
+            estanteria TEXT NOT NULL,
+            fila_max INTEGER NOT NULL,
+            col_max TEXT NOT NULL DEFAULT 'D',
+            UNIQUE(area, estanteria)
         )""")
 
 def bitacora(accion, entidad, detalle):
@@ -734,6 +746,7 @@ def obtener_menu_principal(usuario):
     if rol == "admin": teclado.append([InlineKeyboardButton("🔐 AUTORIZACIÓN", callback_data="menu_autorizacion")])
     if rol == "admin": teclado.append([InlineKeyboardButton("💾 BACKUP BASE DE DATOS", callback_data="accion_backup")])
     if rol == "admin": teclado.append([InlineKeyboardButton("🗑️ PAPELERA", callback_data="pap_lista"), InlineKeyboardButton("📜 BITÁCORA", callback_data="bit_menu")])
+    if rol == "admin": teclado.append([InlineKeyboardButton("🏗️ ESTRUCTURA", callback_data="est_inicio"), InlineKeyboardButton("🔎 REVISAR UBICACIONES", callback_data="rev_inicio")])
     teclado.append([InlineKeyboardButton("👤 MI INFORMACIÓN", callback_data="menu_info")])
     return InlineKeyboardMarkup(teclado)
     
@@ -1118,19 +1131,28 @@ async def reg_est(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return REG_FIL
 
 async def reg_fil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    err = error_fila("E", context.user_data.get("estanteria", ""), update.message.text)
+    if err: await update.message.reply_text(f"⚠️ {err}\nEscribe la fila de nuevo:"); return REG_FIL
     context.user_data["fila"] = update.message.text.strip()
     await update.message.reply_text("7️⃣ Columna (A a D; hasta F en las estanterías grandes):")
     return REG_COL
 
 async def reg_col(update: Update, context: ContextTypes.DEFAULT_TYPE):
     col = update.message.text.strip().upper()
-    if col not in list("ABCDEF"): await update.message.reply_text("⚠️ Debe ser una letra de A a F:"); return REG_COL
+    err = error_columna("E", context.user_data.get("estanteria", ""), col)
+    if err: await update.message.reply_text(f"⚠️ {err}\nEscribe la columna de nuevo:"); return REG_COL
     context.user_data["columna"] = col
     await update.message.reply_text("8️⃣ Pila/Nivel:")
     return REG_PIL
 
 async def reg_pil(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["pila"] = update.message.text.strip()
+    d, texto = context.user_data, update.message.text.strip()
+    err, aviso = validar_ubicacion("E", d.get("estanteria", ""), d.get("fila", "0"), d.get("columna", "A"), texto)
+    if err: await update.message.reply_text(f"⚠️ {err}\nEscribe el nivel de nuevo:"); return REG_PIL
+    if aviso:
+        d["pila_pend"] = texto
+        await update.message.reply_text(f"⚠️ {aviso}\n¿Confirmas que este paquete va en el nivel {texto}?", reply_markup=teclado_nivel5("rn5")); return REG_N5
+    d["pila"] = texto
     return await _reg_pedir_general(update, context)
 
 async def _reg_guardar(update, context, general):
@@ -1302,19 +1324,28 @@ async def flujo_evento_est(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return EV_FIL
 
 async def flujo_evento_fil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    err = error_fila("V", context.user_data.get("ev_est", ""), update.message.text)
+    if err: await update.message.reply_text(f"⚠️ {err}\nEscribe la fila de nuevo:"); return EV_FIL
     context.user_data["ev_fil"] = update.message.text.strip()
     await update.message.reply_text("Ingresa la Columna (A a D; hasta F en las estanterías grandes):")
     return EV_COL
 
 async def flujo_evento_col(update: Update, context: ContextTypes.DEFAULT_TYPE):
     col = update.message.text.strip().upper()
-    if col not in list("ABCDEF"): await update.message.reply_text("⚠️ Debe ser una letra de A a F:"); return EV_COL
+    err = error_columna("V", context.user_data.get("ev_est", ""), col)
+    if err: await update.message.reply_text(f"⚠️ {err}\nEscribe la columna de nuevo:"); return EV_COL
     context.user_data["ev_col"] = col
     await update.message.reply_text("Ingresa la Pila/Nivel:")
     return EV_PIL
 
 async def flujo_evento_pil(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["ev_pil"] = update.message.text.strip()
+    d, texto = context.user_data, update.message.text.strip()
+    err, aviso = validar_ubicacion("V", d.get("ev_est", ""), d.get("ev_fil", "0"), d.get("ev_col", "A"), texto)
+    if err: await update.message.reply_text(f"⚠️ {err}\nEscribe el nivel de nuevo:"); return EV_PIL
+    if aviso:
+        d["pila_pend"] = texto
+        await update.message.reply_text(f"⚠️ {aviso}\n¿Confirmas que este paquete va en el nivel {texto}?", reply_markup=teclado_nivel5("evn5")); return EV_N5
+    d["ev_pil"] = texto
     return await _ev_guardar(update, context)
 
 async def _ev_guardar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1858,7 +1889,13 @@ def insertar_paquete(dpi, num, f_del, f_al, est, fil, col, pil, general=None):
 
 def actualizar_paquete_clave(dpi, num, campo, valor):
     antes = buscar_por_dpi_y_numero(dpi, num)
+    aviso_nivel = None
+    if antes and campo in ("estanteria", "fila", "columna", "pila"):
+        nueva = dict(antes); nueva[campo] = valor.strip()
+        err, aviso_nivel = validar_ubicacion("E", nueva.get("estanteria"), nueva.get("fila"), nueva.get("columna"), nueva.get("pila"))
+        if err: return False, err, num
     ok, msg, nuevo_num = _actualizar_paquete_clave(dpi, num, campo, valor)
+    if ok and aviso_nivel: msg = f"{msg}\n⚠️ {aviso_nivel}" if msg else f"⚠️ {aviso_nivel}"
     if ok:
         despues = buscar_por_dpi_y_numero(dpi, nuevo_num)
         bitacora("EDITAR", "paquete", f"{dpi} N° {num}: {campo} {antes.get(campo) if antes else '?'} → {despues.get(campo) if despues else valor}")
@@ -1879,6 +1916,10 @@ def insertar_evento(tipo, anio, num_paq, folio_ini, folio_fin, num_general, est,
 
 def actualizar_evento_id(id_evento, campo, valor):
     antes = buscar_evento_por_id(id_evento)
+    if antes and campo in ("estanteria", "fila", "columna", "pila"):
+        nueva = dict(antes); nueva[campo] = valor.strip()
+        err, _ = validar_ubicacion("V", nueva.get("estanteria"), nueva.get("fila"), nueva.get("columna"), nueva.get("pila"))
+        if err: return False, err
     ok, error = _actualizar_evento_id(id_evento, campo, valor)
     if ok:
         despues = buscar_evento_por_id(id_evento)
@@ -2288,6 +2329,8 @@ def texto_ubicacion(u):
 
 def columnas_estanteria(tabla, est):
     """Columnas disponibles: A-D por defecto; hasta F si la estantería lo tiene configurado o ya usa E/F."""
+    e = estructura_de(AREA_DE_TABLA.get(tabla), est)
+    if e: return "ABCDEF"[: "ABCDEF".index(e[1]) + 1]
     if str(est) in COLUMNAS_POR_ESTANTERIA.get(tabla, {}): return COLUMNAS_POR_ESTANTERIA[tabla][str(est)]
     try:
         r = conectar_db().execute(f"SELECT MAX(UPPER(columna)) FROM {tabla} WHERE estanteria = ?", (est,))
@@ -2313,10 +2356,12 @@ def sugerir_ubicacion(tabla, ref, ocupada):
     """ref = (est, fila, col, pila) del último paquete. Devuelve {'sug', 'alt5', 'saltos'} o None."""
     est, fila, col, pila = [str(x) for x in ref]
     columnas = columnas_estanteria(tabla, est)
+    e = estructura_de(AREA_DE_TABLA.get(tabla), est)
     pos, saltos = (est, fila, col, pila), 0
     for _ in range(80):
         pos = siguiente_posicion(*pos, columnas)
         if pos is None: return None
+        if e and int(pos[1]) > e[0]: return None  # la siguiente fila ya no existe en esa estantería
         if not ocupada(*pos): break
         saltos += 1
     else:
@@ -2415,10 +2460,12 @@ def generar_mapa_estanteria(area, est, resaltar=None):
     resaltar = set(resaltar or [])
     ocupados, sin_ubicar = datos_estanteria(area, est)
     if not ocupados: return None, None
-    max_fila = max(max(f for f, _, _ in ocupados), FILAS_POR_ESTANTERIA.get(tabla, {}).get(str(est), 0))
+    estr = estructura_de(area, est)
+    max_fila = max(max(f for f, _, _ in ocupados), estr[0] if estr else FILAS_POR_ESTANTERIA.get(tabla, {}).get(str(est), 0))
     filas = list(range(0, max_fila + 1))
     usadas = {c for _, c, _ in ocupados}
-    if str(est) in COLUMNAS_POR_ESTANTERIA.get(tabla, {}): columnas = COLUMNAS_POR_ESTANTERIA[tabla][str(est)]
+    if estr: columnas = "ABCDEF"[: "ABCDEF".index(estr[1]) + 1]
+    elif str(est) in COLUMNAS_POR_ESTANTERIA.get(tabla, {}): columnas = COLUMNAS_POR_ESTANTERIA[tabla][str(est)]
     else:
         mayor = max(usadas | {"D"})
         columnas = "ABCDEF"[: "ABCDEF".index(mayor) + 1] if mayor in "ABCDEF" else COLUMNAS_BASE
@@ -2673,6 +2720,9 @@ def parsear_carga(texto, usuario):
                 col = col.upper()
                 if col not in tuple("ABCDEF"): raise ValueError("la columna debe ser A-F")
                 if not est: raise ValueError("falta la estantería")
+                err_u, aviso_u = validar_ubicacion("E", est, fila, col, pila)
+                if err_u: raise ValueError(err_u)
+                if aviso_u: avisos.append((nro, aviso_u))
                 clave = (dpi.lower(), paq)
                 if clave in vistos["paq"]: raise ValueError(f"el paquete {paq} de {dpi} está repetido en el archivo")
                 vistos["paq"].add(clave)
@@ -2715,6 +2765,9 @@ def parsear_carga(texto, usuario):
                 col = col.upper()
                 if col not in tuple("ABCDEF"): raise ValueError("la columna debe ser A-F")
                 if not est: raise ValueError("falta la estantería")
+                err_u, aviso_u = validar_ubicacion("V", est, fila, col, pila)
+                if err_u: raise ValueError(err_u)
+                if aviso_u: avisos.append((nro, aviso_u))
                 clave = (tipo, anio, paq)
                 if clave in vistos["ev"]: raise ValueError(f"el paquete {paq} de {tipo} {anio} está repetido en el archivo")
                 vistos["ev"].add(clave)
@@ -2910,6 +2963,262 @@ async def cargar_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(texto, reply_markup=btn_volver)
     context.user_data.clear()
     return ConversationHandler.END
+
+# --- ESTRUCTURA DE LAS ESTANTERÍAS, VALIDACIÓN Y REVISIÓN DE UBICACIONES ---
+NOMBRE_AREA = {"E": "Enrolamiento DPI", "V": "Eventos SIRECI"}
+AREA_DE_TABLA = {"paquetes": "E", "eventos": "V"}
+_ESTRUCTURA = {"ts": 0.0, "datos": {}}
+
+def cargar_estructura(forzar=False):
+    """{(area, estantería): (última_fila, última_columna)}. Se guarda en la base (tabla estanterias) y se refresca cada minuto."""
+    if not forzar and _ESTRUCTURA["ts"] > 0 and time.time() - _ESTRUCTURA["ts"] < 60:
+        return _ESTRUCTURA["datos"]
+    datos = {}
+    try:
+        for r in conectar_db().execute("SELECT area, estanteria, fila_max, col_max FROM estanterias").rows:
+            datos[(str(r[0]), str(r[1]).strip())] = (int(r[2]), (str(r[3]).strip().upper() or "D"))
+    except Exception:
+        datos = _ESTRUCTURA["datos"]  # si falla la consulta, usa lo último que se conocía
+    _ESTRUCTURA["ts"], _ESTRUCTURA["datos"] = time.time(), datos
+    return datos
+
+def estructura_de(area, est):
+    if area not in NOMBRE_AREA: return None
+    return cargar_estructura().get((area, str(est).strip()))
+
+def guardar_estructura(area, est, fila_max, col_max):
+    conectar_db().execute(
+        "INSERT INTO estanterias (area, estanteria, fila_max, col_max) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(area, estanteria) DO UPDATE SET fila_max = excluded.fila_max, col_max = excluded.col_max",
+        (area, str(est).strip(), int(fila_max), col_max.upper()))
+    cargar_estructura(forzar=True)
+    bitacora("ESTRUCTURA", "estantería", f"{NOMBRE_AREA[area]} · estantería {est}: filas 0 a {fila_max}, columnas A a {col_max.upper()}")
+
+def quitar_estructura(area, est):
+    conectar_db().execute("DELETE FROM estanterias WHERE area = ? AND estanteria = ?", (area, str(est).strip()))
+    cargar_estructura(forzar=True)
+    bitacora("ESTRUCTURA", "estantería", f"{NOMBRE_AREA[area]} · estantería {est}: estructura eliminada")
+
+def proponer_estructura(area):
+    """Propone la estructura según lo ya guardado: {estantería: (última fila usada, última columna usada, mínimo D)}."""
+    tabla = "paquetes" if area == "E" else "eventos"
+    prop = {}
+    for r in conectar_db().execute(f"SELECT estanteria, MAX(CAST(fila AS INTEGER)), MAX(UPPER(columna)) FROM {tabla} GROUP BY estanteria").rows:
+        if r[0] is None or str(r[0]).strip() == "": continue
+        col = str(r[2] or "D").strip().upper()
+        prop[str(r[0]).strip()] = (int(r[1] or 0), col if (len(col) == 1 and "D" <= col <= "F") else "D")
+    return dict(sorted(prop.items(), key=lambda kv: (0, int(kv[0])) if kv[0].isdigit() else (1, kv[0])))
+
+def error_fila(area, est, fila):
+    fila = str(fila).strip()
+    if not fila.isdigit(): return "La fila debe ser un número (0 o más)."
+    e = estructura_de(area, est)
+    if e and int(fila) > e[0]: return f"La fila {int(fila)} no existe: la estantería {str(est).strip()} llega hasta la fila {e[0]}."
+    return None
+
+def error_columna(area, est, col):
+    col = str(col).strip().upper()
+    if len(col) != 1 or col not in "ABCDEF": return "La columna debe ser una letra de A a F."
+    e = estructura_de(area, est)
+    if e and col > e[1]: return f"La columna {col} no existe: la estantería {str(est).strip()} llega hasta la columna {e[1]}."
+    return None
+
+def validar_ubicacion(area, est, fila, col, pila):
+    """Devuelve (error, aviso). El error impide guardar; el aviso (nivel 5) pide confirmación o se informa."""
+    err = error_fila(area, est, fila) or error_columna(area, est, col)
+    if err: return err, None
+    pila = str(pila).strip()
+    if not pila.isdigit() or int(pila) < 1: return "El nivel (pila) debe ser un número desde 1.", None
+    f, n = int(str(fila).strip()), int(pila)
+    if f != 0:
+        if n > NIVELES_NORMALES + 1:
+            return (f"El nivel {n} no es válido: de la fila 1 en adelante el máximo es {NIVELES_NORMALES + 1} "
+                    f"(el {NIVELES_NORMALES + 1} es excepcional). Solo la fila 0 no tiene límite."), None
+        if n == NIVELES_NORMALES + 1:
+            return None, f"Nivel {n}: es excepcional (lo normal es hasta el {NIVELES_NORMALES})."
+    return None, None
+
+# --- Revisión de ubicaciones ya guardadas ---
+ORDEN_HALLAZGO = ["inexistente", "nivel", "incompleta", "duplicado", "hueco", "nivel5"]
+NOMBRE_HALLAZGO = {"inexistente": "Fila o columna que no existe", "nivel": "Nivel por encima del límite", "incompleta": "Ubicación incompleta o no numérica",
+                   "duplicado": "Dos o más paquetes en el mismo lugar", "hueco": "Nivel con un hueco debajo", "nivel5": "Nivel 5 (excepcional, solo informativo)"}
+
+def revisar_ubicaciones(area):
+    """Devuelve (hallazgos, sin_estructura). hallazgo = (tipo, referencia, ubicación, explicación, callback_de_corrección)."""
+    cargar_estructura(forzar=True)
+    client = conectar_db()
+    items = []
+    if area == "E":
+        for r in client.execute("SELECT usuario_codigo, num_paquete, estanteria, fila, columna, pila FROM paquetes").rows:
+            items.append((f"{r[0]} N° {r[1]}", r[2], r[3], r[4], r[5], f"pe_ed_{r[0]}|{r[1]}"))
+    else:
+        for r in client.execute("SELECT id, tipo_evento, anio, num_paquete, estanteria, fila, columna, pila FROM eventos").rows:
+            items.append((f"{r[1]} {r[2]} Paq {r[3]}", r[4], r[5], r[6], r[7], f"ev_ed_{r[0]}"))
+    hallazgos, ocup, por_columna, sin_estructura, con_error = [], {}, {}, set(), set()
+    for ref, est, fila, col, pila, cb in items:
+        est, fila, col, pila = str(est).strip(), str(fila).strip(), str(col).strip().upper(), str(pila).strip()
+        loc = f"E{est}-F{fila}-{col}-P{pila}"
+        if estructura_de(area, est) is None: sin_estructura.add(est)
+        if not (fila.isdigit() and pila.isdigit() and len(col) == 1 and col.isalpha()):
+            hallazgos.append(("incompleta", ref, loc, "faltan datos o no son numéricos", cb)); continue
+        err, aviso = validar_ubicacion(area, est, fila, col, pila)
+        if err:
+            hallazgos.append(("inexistente" if err.startswith(("La fila", "La columna")) else "nivel", ref, loc, err, cb))
+            con_error.add((est, int(fila), col, int(pila)))
+        elif aviso:
+            hallazgos.append(("nivel5", ref, loc, "nivel 5", cb))
+        ocup.setdefault((est, int(fila), col, int(pila)), []).append((ref, cb))
+        por_columna.setdefault((est, int(fila), col), set()).add(int(pila))
+    for (est, f, col, n), lista in ocup.items():
+        if len(lista) > 1:
+            for ref, cb in lista:
+                hallazgos.append(("duplicado", ref, f"E{est}-F{f}-{col}-P{n}", f"comparte el lugar con {len(lista) - 1} paquete(s) más", cb))
+    for (est, f, col), niveles in por_columna.items():
+        for n in sorted(niveles):
+            if n > 1 and (n - 1) not in niveles and (est, f, col, n) not in con_error:
+                ref, cb = ocup[(est, f, col, n)][0]  # un solo aviso por lugar (los repetidos ya salen como "mismo lugar")
+                hallazgos.append(("hueco", ref, f"E{est}-F{f}-{col}-P{n}", f"el nivel {n - 1} de esa columna está vacío", cb))
+    hallazgos.sort(key=lambda h: (ORDEN_HALLAZGO.index(h[0]), h[2], h[1]))
+    return hallazgos, sorted(sin_estructura, key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
+
+POR_PAGINA_REV = 8
+
+async def revision_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin"])
+    if not usuario: return
+    query = update.callback_query; await query.answer()
+    if query.data == "rev_inicio":
+        teclado = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Enrolamiento DPI", callback_data="rev_E_1")],
+                                        [InlineKeyboardButton("📖 Eventos SIRECI", callback_data="rev_V_1")],
+                                        [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+        await editar_texto(query, "🔎 REVISAR UBICACIONES\n\nBusca filas o columnas que no existen, niveles fuera del límite, paquetes en el mismo lugar y niveles con un hueco debajo.\n\n¿Qué área revisamos?", reply_markup=teclado); return
+    _, area, pagina = query.data.split("_")
+    pagina = max(1, int(pagina))
+    hallazgos, sin_estructura = await asyncio.to_thread(revisar_ubicaciones, area)
+    resumen = {}
+    for h in hallazgos: resumen[h[0]] = resumen.get(h[0], 0) + 1
+    lineas = [f"🔎 Revisión · {NOMBRE_AREA[area]}"]
+    problemas = sum(v for k, v in resumen.items() if k != "nivel5")
+    lineas.append("✅ No encontré problemas." if problemas == 0 else f"⚠️ {problemas} hallazgo(s) por revisar.")
+    for tipo in ORDEN_HALLAZGO:
+        if tipo in resumen: lineas.append(f"• {NOMBRE_HALLAZGO[tipo]}: {resumen[tipo]}")
+    if sin_estructura:
+        lineas.append(f"\nℹ️ Estantería(s) sin estructura registrada: {', '.join(sin_estructura)}. En esas no puedo verificar filas ni columnas; regístralas en 🏗️ ESTRUCTURA.")
+    paginas = max(1, -(-len(hallazgos) // POR_PAGINA_REV)); pagina = min(pagina, paginas)
+    trozo = hallazgos[(pagina - 1) * POR_PAGINA_REV: pagina * POR_PAGINA_REV]
+    botones = []
+    if trozo:
+        lineas.append(f"\nPágina {pagina} de {paginas}:")
+        for i, (tipo, ref, loc, expl, cb) in enumerate(trozo, start=1):
+            lineas.append(f"{i}) {ref} · {loc}\n    {expl}")
+            botones.append([InlineKeyboardButton(f"✏️ Corregir {i}: {ref}"[:60], callback_data=cb)])
+        nav = []
+        if pagina > 1: nav.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"rev_{area}_{pagina - 1}"))
+        if pagina < paginas: nav.append(InlineKeyboardButton("Siguiente ➡️", callback_data=f"rev_{area}_{pagina + 1}"))
+        if nav: botones.append(nav)
+    botones.append([InlineKeyboardButton("🔄 Revisar de nuevo", callback_data=f"rev_{area}_{pagina}"), InlineKeyboardButton("⬅️ Otra área", callback_data="rev_inicio")])
+    botones.append([InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")])
+    await editar_texto(query, "\n".join(lineas)[:3900], reply_markup=InlineKeyboardMarkup(botones))
+
+async def revision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin"])
+    if not usuario: return
+    teclado = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Enrolamiento DPI", callback_data="rev_E_1")],
+                                    [InlineKeyboardButton("📖 Eventos SIRECI", callback_data="rev_V_1")]])
+    await update.message.reply_text("🔎 REVISAR UBICACIONES\n\n¿Qué área revisamos?", reply_markup=teclado)
+
+# --- Administración de la estructura (solo administradores) ---
+def texto_estructura(area):
+    defin = {est: v for (a, est), v in cargar_estructura(True).items() if a == area}
+    prop = proponer_estructura(area)
+    nombres = sorted(set(defin) | set(prop), key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
+    lineas = [f"🏗️ ESTRUCTURA · {NOMBRE_AREA[area]}", ""]
+    if not nombres: lineas.append("Aún no hay estanterías con paquetes ni estructura registrada.")
+    for est in nombres:
+        if est in defin:
+            lineas.append(f"• Estantería {est}: filas 0 a {defin[est][0]}, columnas A a {defin[est][1]}")
+        else:
+            f, c = prop[est]
+            lineas.append(f"• Estantería {est}: sin definir (los paquetes llegan a la fila {f}, columna {c})")
+    return "\n".join(lineas)
+
+async def estructura_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin"])
+    if not usuario: return
+    query = update.callback_query; await query.answer()
+    if query.data == "est_inicio":
+        teclado = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Enrolamiento DPI", callback_data="est_area_E")],
+                                        [InlineKeyboardButton("📖 Eventos SIRECI", callback_data="est_area_V")],
+                                        [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
+        await editar_texto(query, "🏗️ ESTRUCTURA DE ESTANTERÍAS\n\nAquí defines cuántas filas y columnas tiene cada estantería (las de Enrolamiento y las de Eventos son distintas). Con eso el bot rechaza ubicaciones que no existen.\n\n¿De qué área?", reply_markup=teclado); return
+    accion, area = query.data.rsplit("_", 1)
+    if accion == "est_area":
+        botones = [[InlineKeyboardButton("✏️ Definir o cambiar una estantería", callback_data=f"est_def_{area}")],
+                   [InlineKeyboardButton("🪄 Proponer según los datos", callback_data=f"est_prop_{area}")],
+                   [InlineKeyboardButton("⬅️ Otra área", callback_data="est_inicio")], [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]]
+        await editar_texto(query, texto_estructura(area), reply_markup=InlineKeyboardMarkup(botones))
+    elif accion == "est_prop":
+        defin = {est for (a, est) in cargar_estructura(True) if a == area}
+        nuevas = {e: v for e, v in proponer_estructura(area).items() if e not in defin}
+        if not nuevas:
+            await editar_texto(query, "Todas las estanterías con paquetes ya tienen estructura definida.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data=f"est_area_{area}")]])); return
+        lineas = [f"🪄 Propuesta · {NOMBRE_AREA[area]}", ""] + [f"• Estantería {e}: filas 0 a {f}, columnas A a {c}" for e, (f, c) in nuevas.items()]
+        lineas.append("\n⚠️ Se calcula con lo que ya está guardado. Si hay paquetes con una fila o columna equivocada, la propuesta saldrá equivocada: corrígelos primero con 🔎 REVISAR UBICACIONES, o ajusta cada estantería a mano.")
+        botones = [[InlineKeyboardButton("✅ Guardar esta propuesta", callback_data=f"est_guardar_{area}")], [InlineKeyboardButton("⬅️ Cancelar", callback_data=f"est_area_{area}")]]
+        await editar_texto(query, "\n".join(lineas), reply_markup=InlineKeyboardMarkup(botones))
+    elif accion == "est_guardar":
+        defin = {est for (a, est) in cargar_estructura(True) if a == area}
+        nuevas = {e: v for e, v in proponer_estructura(area).items() if e not in defin}
+        for e, (f, c) in nuevas.items(): guardar_estructura(area, e, f, c)
+        await editar_texto(query, f"✅ Se guardó la estructura de {len(nuevas)} estantería(s).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Ver estructura", callback_data=f"est_area_{area}")]]))
+
+async def estructura_definir_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = await verificar_acceso(update, ["admin"])
+    if not usuario: return ConversationHandler.END
+    query = update.callback_query; await query.answer()
+    area = query.data.replace("est_def_", "")
+    context.user_data["est_area"] = area
+    await editar_texto(query, f"✏️ {NOMBRE_AREA[area]}\n\nEscribe: <estantería> <última fila> <última columna>\nEjemplo: 1 4 D   (la estantería 1 tiene filas 0 a 4 y columnas A a D)\n\nPara quitar la estructura de una estantería: <estantería> quitar\n\n(/cancelar para salir)")
+    return ES_TEXTO
+
+async def estructura_definir_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    area = context.user_data.get("est_area", "E")
+    partes = update.message.text.split()
+    btn = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Ver estructura", callback_data=f"est_area_{area}")]])
+    try:
+        if len(partes) == 2 and partes[1].lower() == "quitar":
+            quitar_estructura(area, partes[0])
+            await update.message.reply_text(f"✅ Se quitó la estructura de la estantería {partes[0]}.", reply_markup=btn)
+        elif len(partes) == 3 and partes[1].isdigit() and len(partes[2]) == 1 and partes[2].upper() in "DEF":
+            guardar_estructura(area, partes[0], int(partes[1]), partes[2])
+            await update.message.reply_text(f"✅ Estantería {partes[0]}: filas 0 a {int(partes[1])}, columnas A a {partes[2].upper()}.", reply_markup=btn)
+        else:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Formato inválido. Ejemplo: 1 4 D   (la última columna puede ser D, E o F). Inténtalo de nuevo o /cancelar:"); return ES_TEXTO
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# --- Confirmación del nivel 5 al escribirlo a mano ---
+async def reg_n5_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    if query.data == "rn5_si":
+        context.user_data["pila"] = context.user_data.pop("pila_pend", "5")
+        return await _reg_pedir_general(update, context)
+    await query.edit_message_text("8️⃣ Pila/Nivel:")
+    return REG_PIL
+
+async def ev_n5_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    if query.data == "evn5_si":
+        context.user_data["ev_pil"] = context.user_data.pop("pila_pend", "5")
+        return await _ev_guardar(update, context)
+    await query.edit_message_text("Ingresa la Pila/Nivel:")
+    return EV_PIL
+
+def teclado_nivel5(prefijo):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Sí, es el nivel 5", callback_data=f"{prefijo}_si"),
+                                  InlineKeyboardButton("✏️ Cambiar", callback_data=f"{prefijo}_no")]])
 
 async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -3155,12 +3464,18 @@ function sugerirSiguiente(tipo, d) {
   if (tipo === 'E') return { usuario: d.usuario, paq: String((parseInt(d.paq, 10) || 0) + 1), est: u.est, fila: u.fila, col: u.col, pila: u.pila, gen: gen };
   return { tipo: d.tipo, anio: d.anio, paq: String((parseInt(d.paq, 10) || 0) + 1), ini: String((parseInt(d.fin, 10) || 0) + 1), est: u.est, fila: u.fila, col: u.col, pila: u.pila, gen: gen };
 }
-function validar(tipo, d) {
+function validar(tipo, d, estr) {
   const entero = (v) => /^\d+$/.test(String(v || '').trim());
   if (!String(d.est || '').trim()) return 'Falta la estantería.';
   if (!entero(d.fila)) return 'La fila debe ser un número (0 o más).';
   if (!/^[A-Fa-f]$/.test(String(d.col || '').trim())) return 'La columna debe ser una letra de A a F.';
   if (!entero(d.pila) || parseInt(d.pila, 10) < 1) return 'La pila / nivel debe ser un número (1 o más).';
+  {
+    const f = parseInt(d.fila, 10), n = parseInt(d.pila, 10), col = String(d.col).trim().toUpperCase(), est = String(d.est).trim(), e = estr && estr[est];
+    if (e && f > e.fila_max) return 'La fila ' + f + ' no existe: la estantería ' + est + ' llega hasta la fila ' + e.fila_max + '.';
+    if (e && col > e.col_max) return 'La columna ' + col + ' no existe: la estantería ' + est + ' llega hasta la columna ' + e.col_max + '.';
+    if (f !== 0 && n > NIVELES + 1) return 'El nivel ' + n + ' no es válido: de la fila 1 en adelante el máximo es ' + (NIVELES + 1) + ' (el ' + (NIVELES + 1) + ' es excepcional). Solo la fila 0 no tiene límite.';
+  }
   if (!entero(d.paq) || parseInt(d.paq, 10) < 1) return 'El N° de paquete debe ser un número.';
   if (String(d.gen || '').trim() && !entero(d.gen)) return 'El N° General debe ser un número o quedar vacío.';
   if (tipo === 'E') {
@@ -3196,6 +3511,7 @@ function hojasHTML(lista) {
 
 const KEY = 'atestados_pendientes_v1';
 const KEY_BOR = 'atestados_borradores_v1';
+const KEY_EST = 'atestados_estructura_v1';
 const CAMPOS = {
   E: [
     { id: 'usuario', et: 'Usuario (DPI o código)', t: 'text' },
@@ -3217,6 +3533,7 @@ let tipo = 'E';
 let items = leer(KEY, []);
 let borradores = leer(KEY_BOR, { E: {}, V: {} });
 let editando = null;
+let estructura = null;
 
 function leer(k, def) { try { const v = JSON.parse(localStorage.getItem(k)); return v === null ? def : v; } catch (e) { return def; } }
 function guardar() { try { localStorage.setItem(KEY, JSON.stringify(items)); localStorage.setItem(KEY_BOR, JSON.stringify(borradores)); } catch (e) { mostrarError('No se pudo guardar en el celular (almacenamiento lleno o bloqueado).'); } }
@@ -3275,8 +3592,9 @@ function dibujarLista() {
   });
 }
 function agregar() {
-  const d = leerForm(), err = validar(tipo, d);
+  const d = leerForm(), err = validar(tipo, d, (estructura || {})[tipo]);
   if (err) { mostrarError(err); return; }
+  if (parseInt(d.fila, 10) !== 0 && parseInt(d.pila, 10) === NIVELES + 1 && !confirm('El nivel ' + (NIVELES + 1) + ' es excepcional (lo normal es hasta el ' + NIVELES + '). ¿Confirmas que este paquete va en el nivel ' + (NIVELES + 1) + '?')) return;
   if (String(d.gen || '').trim()) {
     const otro = items.findIndex((it, i) => i !== editando && it.tipo === tipo && String(it.datos.gen || '').trim() !== '' && parseInt(it.datos.gen, 10) === parseInt(d.gen, 10));
     if (otro >= 0) { mostrarError('El N° General ' + d.gen + ' ya lo usaste en otro pendiente (Paq ' + items[otro].datos.paq + '). Cambia el número o déjalo vacío para que lo asigne el bot.'); return; }
@@ -3338,6 +3656,8 @@ $('lista').onclick = (ev) => {
 $('lista').onchange = (ev) => { const s = ev.target.getAttribute('data-s'); if (s !== null) { items[+s].sel = ev.target.checked; guardar(); dibujarLista(); } };
 window.addEventListener('online', estadoRed); window.addEventListener('offline', estadoRed);
 estadoRed(); dibujarForm(); dibujarLista();
+estructura = leer(KEY_EST, { E: {}, V: {} });
+if (navigator.onLine && window.fetch) fetch('/offline/estructura.json', { cache: 'no-store' }).then((r) => r.json()).then((j) => { estructura = j; try { localStorage.setItem(KEY_EST, JSON.stringify(j)); } catch (e) {} }).catch(() => {});
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/offline/sw.js', { scope: '/offline/' }).catch(function () {});
 </script>
 </body>
@@ -3368,6 +3688,16 @@ def offline_manifest():
              "icons": [{"src": "/offline/icon.png", "sizes": "192x192", "type": "image/png", "purpose": "any"}]}
     return Response(json.dumps(datos), mimetype="application/manifest+json")
 
+@app_web.route('/offline/estructura.json')
+def offline_estructura():
+    datos = {"E": {}, "V": {}}
+    try:
+        for (area, est), (fila_max, col_max) in cargar_estructura(True).items():
+            datos[area][est] = {"fila_max": fila_max, "col_max": col_max}
+    except Exception:
+        pass
+    r = Response(json.dumps(datos), mimetype="application/json"); r.headers["Cache-Control"] = "no-store"; return r
+
 @app_web.route('/offline/sw.js')
 def offline_sw():
     r = Response(OFFLINE_SW, mimetype="application/javascript")
@@ -3397,6 +3727,7 @@ if __name__ == "__main__":
     inicializar_tabla_telegram()
     inicializar_tabla_eventos()
     inicializar_papelera_bitacora()
+    inicializar_estructura()
     
     app = Application.builder().token(TOKEN).build()
     
@@ -3410,6 +3741,15 @@ if __name__ == "__main__":
             CG_CONFIRMAR: [CallbackQueryHandler(cargar_confirmar, pattern="^cg_(si|auto|upd|todo)$"),
                            MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.Document.ALL, cargar_recibir)],
         },
+        fallbacks=[CommandHandler("cancelar", cancelar), CallbackQueryHandler(cancelar_a_menu, pattern="^menu_inicio$")],
+        per_message=False,
+    ))
+    app.add_handler(CommandHandler("revisar", revision_cmd))
+    app.add_handler(CallbackQueryHandler(revision_cb, pattern="^rev_"))
+    app.add_handler(CallbackQueryHandler(estructura_cb, pattern="^est_(inicio|area_[EV]|prop_[EV]|guardar_[EV])$"))
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(estructura_definir_inicio, pattern="^est_def_[EV]$")],
+        states={ES_TEXTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, estructura_definir_texto)]},
         fallbacks=[CommandHandler("cancelar", cancelar), CallbackQueryHandler(cancelar_a_menu, pattern="^menu_inicio$")],
         per_message=False,
     ))
@@ -3451,6 +3791,7 @@ if __name__ == "__main__":
             REG_NUM: [CallbackQueryHandler(reg_num_cb, pattern="^rsugnum_"),
                       MessageHandler(filters.TEXT & ~filters.COMMAND, reg_num)],
             REG_UBIC: [CallbackQueryHandler(reg_ubic_cb, pattern="^rsugubi_")],
+            REG_N5: [CallbackQueryHandler(reg_n5_cb, pattern="^rn5_")],
             REG_EST: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_est)],
             REG_FIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_fil)],
             REG_COL: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_col)],
@@ -3477,6 +3818,7 @@ if __name__ == "__main__":
             EV_GENERAL: [CallbackQueryHandler(flujo_evento_general_cb, pattern="^suggen_"),
                          MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_general)],
             EV_UBIC: [CallbackQueryHandler(ev_ubic_cb, pattern="^evsugubi_")],
+            EV_N5: [CallbackQueryHandler(ev_n5_cb, pattern="^evn5_")],
             EV_EST: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_est)],
             EV_FIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_fil)],
             EV_COL: [MessageHandler(filters.TEXT & ~filters.COMMAND, flujo_evento_col)],
