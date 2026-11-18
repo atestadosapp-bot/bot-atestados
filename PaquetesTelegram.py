@@ -159,15 +159,19 @@ def inicializar_papelera_bitacora():
         )""")
 
 def inicializar_estructura():
-    conectar_db().execute("""
+    client = conectar_db()
+    client.execute("""
         CREATE TABLE IF NOT EXISTS estanterias (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             area TEXT NOT NULL,
             estanteria TEXT NOT NULL,
             fila_max INTEGER NOT NULL,
             col_max TEXT NOT NULL DEFAULT 'D',
+            niv_max INTEGER,
             UNIQUE(area, estanteria)
         )""")
+    try: client.execute("ALTER TABLE estanterias ADD COLUMN niv_max INTEGER")  # bases creadas antes de esta versión
+    except Exception: pass
 
 def bitacora(accion, entidad, detalle):
     """Registra una acción en la bitácora. Nunca interrumpe la operación si falla."""
@@ -2340,11 +2344,11 @@ def columnas_estanteria(tabla, est):
     if len(str(mayor)) != 1 or str(mayor) not in "DEF": mayor = "D"
     return "ABCDEF"[: "ABCDEF".index(str(mayor)) + 1]
 
-def siguiente_posicion(est, fila, col, pila, columnas):
+def siguiente_posicion(est, fila, col, pila, columnas, niveles=NIVELES_NORMALES):
     """Siguiente casilla: sube de nivel; si la columna se llena pasa a la siguiente; si la fila se llena, a la siguiente fila."""
     if not str(pila).isdigit(): return None
     n = int(pila)
-    if str(fila) == FILA_SIN_TECHO or n < NIVELES_NORMALES:
+    if str(fila) == FILA_SIN_TECHO or n < niveles:
         return (est, fila, col, str(n + 1))
     if col in columnas and columnas.index(col) + 1 < len(columnas):
         return (est, fila, columnas[columnas.index(col) + 1], "1")
@@ -2357,9 +2361,10 @@ def sugerir_ubicacion(tabla, ref, ocupada):
     est, fila, col, pila = [str(x) for x in ref]
     columnas = columnas_estanteria(tabla, est)
     e = estructura_de(AREA_DE_TABLA.get(tabla), est)
+    niveles = e[2] if e and e[2] else NIVELES_NORMALES
     pos, saltos = (est, fila, col, pila), 0
     for _ in range(80):
-        pos = siguiente_posicion(*pos, columnas)
+        pos = siguiente_posicion(*pos, columnas, niveles)
         if pos is None: return None
         if e and int(pos[1]) > e[0]: return None  # la siguiente fila ya no existe en esa estantería
         if not ocupada(*pos): break
@@ -2367,7 +2372,7 @@ def sugerir_ubicacion(tabla, ref, ocupada):
     else:
         return None
     alt5 = None
-    if fila != FILA_SIN_TECHO and pila.isdigit() and int(pila) == NIVELES_NORMALES:
+    if not (e and e[2]) and fila != FILA_SIN_TECHO and pila.isdigit() and int(pila) == NIVELES_NORMALES:
         candidata = (est, fila, col, str(NIVELES_NORMALES + 1))
         if not ocupada(*candidata): alt5 = candidata
     return {"sug": pos, "alt5": alt5, "saltos": saltos}
@@ -2470,10 +2475,11 @@ def generar_mapa_estanteria(area, est, resaltar=None):
         mayor = max(usadas | {"D"})
         columnas = "ABCDEF"[: "ABCDEF".index(mayor) + 1] if mayor in "ABCDEF" else COLUMNAS_BASE
     columnas += "".join(sorted(c for c in usadas if c not in columnas))
+    niv_lim = estr[2] if (estr and estr[2]) else NIVELES_NORMALES
     niveles = {}
     for f in filas:
         usados = [n for (ff, _, n) in ocupados if ff == f]
-        niveles[f] = max(NIVELES_NORMALES, (max(usados) + 1) if (f == 0 and usados) else (max(usados) if usados else 0))
+        niveles[f] = max(niv_lim, (max(usados) + 1) if (f == 0 and usados) else (max(usados) if usados else 0))
     ancho_celda, alto_caja, margen_izq, margen_sup, espacio = 178, 30, 100, 122, 14
     ancho = margen_izq + len(columnas) * ancho_celda + 20
     alto = margen_sup + sum(niveles[f] * alto_caja + espacio for f in filas) + 64
@@ -2504,8 +2510,8 @@ def generar_mapa_estanteria(area, est, resaltar=None):
                 borde_ancho, fuente = 2, f_txt
                 if not registros:
                     clave = "libre"
-                    texto = f"N{nivel} (extra)" if (f > 0 and nivel > NIVELES_NORMALES) else f"N{nivel}"
-                    if f > 0 and nivel <= NIVELES_NORMALES: libres += 1
+                    texto = f"N{nivel} (extra)" if (f > 0 and nivel > niv_lim) else f"N{nivel}"
+                    if f > 0 and nivel <= niv_lim: libres += 1
                     fuente = f_peq
                 else:
                     if len(registros) > 1: clave, texto = "conflicto", f"! {len(registros)} paquetes"; conflictos += 1
@@ -2521,7 +2527,7 @@ def generar_mapa_estanteria(area, est, resaltar=None):
         y += n * alto_caja + espacio
     d.text((margen_izq, 14), f"Estantería {est} · {nombre_area}", font=f_tit, fill=(20, 20, 20))
     total_ocup = ocupados_n + conflictos
-    d.text((margen_izq, 46), f"{total_ocup} nivel(es) ocupado(s) · {libres} libre(s) hasta el nivel {NIVELES_NORMALES} (sin contar la fila 0)", font=f_sub, fill=(70, 70, 70))
+    d.text((margen_izq, 46), f"{total_ocup} nivel(es) ocupado(s) · {libres} libre(s) hasta el nivel {niv_lim} (sin contar la fila 0)", font=f_sub, fill=(70, 70, 70))
     leyenda = [("libre", "Libre"), ("ocupado", "Ocupado"), ("conflicto", "Ocupado 2+ veces")]
     if resaltar: leyenda.append(("resaltado", "Resultado de la búsqueda"))
     ly = y + 14
@@ -2531,7 +2537,7 @@ def generar_mapa_estanteria(area, est, resaltar=None):
         d.rectangle([lx, ly, lx + 18, ly + 18], fill=relleno, outline=borde, width=3 if clave == "resaltado" else 2)
         d.text((lx + 26, ly + 9), nombre, font=f_peq, fill=(60, 60, 60), anchor="lm")
     buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
-    return buf, {"ocupados": total_ocup, "libres": libres, "conflictos": conflictos, "sin_ubicar": sin_ubicar, "marcados": marcados}
+    return buf, {"ocupados": total_ocup, "libres": libres, "conflictos": conflictos, "sin_ubicar": sin_ubicar, "marcados": marcados, "nivel_max": niv_lim}
 
 async def enviar_mapas_resultado(mensaje, area, paquetes, max_mapas=3):
     """Después de una búsqueda: envía el dibujo de la estantería con el/los paquete(s) encontrado(s) resaltado(s).
@@ -2586,7 +2592,7 @@ async def _enviar_mapa(mensaje, area, est, como_archivo=False):
                                 [InlineKeyboardButton("🔙 Volver al Menú", callback_data="menu_inicio")]])
     if buf is None:
         await mensaje.reply_text(f"🗄️ La estantería {est} de {nombre_area} no tiene paquetes registrados todavía.", reply_markup=btn); return
-    caption = f"🗄️ Estantería {est} · {nombre_area}: {resumen['ocupados']} ocupado(s) · {resumen['libres']} libre(s) hasta nivel {NIVELES_NORMALES}"
+    caption = f"🗄️ Estantería {est} · {nombre_area}: {resumen['ocupados']} ocupado(s) · {resumen['libres']} libre(s) hasta nivel {resumen['nivel_max']}"
     if resumen["conflictos"]: caption += f"\n⚠️ {resumen['conflictos']} ubicación(es) con más de un paquete"
     if resumen["sin_ubicar"]: caption += f"\nℹ️ {resumen['sin_ubicar']} paquete(s) con ubicación incompleta no se dibujan"
     if como_archivo:
@@ -2970,13 +2976,15 @@ AREA_DE_TABLA = {"paquetes": "E", "eventos": "V"}
 _ESTRUCTURA = {"ts": 0.0, "datos": {}}
 
 def cargar_estructura(forzar=False):
-    """{(area, estantería): (última_fila, última_columna)}. Se guarda en la base (tabla estanterias) y se refresca cada minuto."""
+    """{(area, estantería): (última_fila, última_columna, niveles_máximos o None)}. Se guarda en la base (tabla estanterias) y se refresca cada minuto."""
     if not forzar and _ESTRUCTURA["ts"] > 0 and time.time() - _ESTRUCTURA["ts"] < 60:
         return _ESTRUCTURA["datos"]
     datos = {}
     try:
-        for r in conectar_db().execute("SELECT area, estanteria, fila_max, col_max FROM estanterias").rows:
-            datos[(str(r[0]), str(r[1]).strip())] = (int(r[2]), (str(r[3]).strip().upper() or "D"))
+        try: filas = conectar_db().execute("SELECT area, estanteria, fila_max, col_max, niv_max FROM estanterias").rows
+        except Exception: filas = [tuple(r) + (None,) for r in conectar_db().execute("SELECT area, estanteria, fila_max, col_max FROM estanterias").rows]
+        for r in filas:
+            datos[(str(r[0]), str(r[1]).strip())] = (int(r[2]), (str(r[3]).strip().upper() or "D"), int(r[4]) if r[4] else None)
     except Exception:
         datos = _ESTRUCTURA["datos"]  # si falla la consulta, usa lo último que se conocía
     _ESTRUCTURA["ts"], _ESTRUCTURA["datos"] = time.time(), datos
@@ -2986,13 +2994,25 @@ def estructura_de(area, est):
     if area not in NOMBRE_AREA: return None
     return cargar_estructura().get((area, str(est).strip()))
 
-def guardar_estructura(area, est, fila_max, col_max):
+def _texto_estructura(fila_max, col_max, niv_max):
+    return f"filas 0 a {fila_max}, columnas A a {col_max.upper()}" + (f", niveles hasta {niv_max}" if niv_max else "")
+
+def guardar_estructura(area, est, fila_max, col_max, niv_max=None):
+    """Guarda filas y columnas. Si niv_max es None se conserva el límite de niveles que ya tuviera."""
     conectar_db().execute(
-        "INSERT INTO estanterias (area, estanteria, fila_max, col_max) VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(area, estanteria) DO UPDATE SET fila_max = excluded.fila_max, col_max = excluded.col_max",
-        (area, str(est).strip(), int(fila_max), col_max.upper()))
+        "INSERT INTO estanterias (area, estanteria, fila_max, col_max, niv_max) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(area, estanteria) DO UPDATE SET fila_max = excluded.fila_max, col_max = excluded.col_max, "
+        "niv_max = COALESCE(excluded.niv_max, estanterias.niv_max)",
+        (area, str(est).strip(), int(fila_max), col_max.upper(), niv_max))
     cargar_estructura(forzar=True)
-    bitacora("ESTRUCTURA", "estantería", f"{NOMBRE_AREA[area]} · estantería {est}: filas 0 a {fila_max}, columnas A a {col_max.upper()}")
+    e = estructura_de(area, est)
+    bitacora("ESTRUCTURA", "estantería", f"{NOMBRE_AREA[area]} · estantería {est}: {_texto_estructura(*e)}")
+
+def guardar_niveles(area, est, niv_max):
+    """Cambia solo el límite de niveles (None = vuelve al límite normal)."""
+    conectar_db().execute("UPDATE estanterias SET niv_max = ? WHERE area = ? AND estanteria = ?", (niv_max, area, str(est).strip()))
+    cargar_estructura(forzar=True)
+    bitacora("ESTRUCTURA", "estantería", f"{NOMBRE_AREA[area]} · estantería {est}: " + (f"niveles hasta {niv_max}" if niv_max else "niveles con el límite normal"))
 
 def quitar_estructura(area, est):
     conectar_db().execute("DELETE FROM estanterias WHERE area = ? AND estanteria = ?", (area, str(est).strip()))
@@ -3000,13 +3020,17 @@ def quitar_estructura(area, est):
     bitacora("ESTRUCTURA", "estantería", f"{NOMBRE_AREA[area]} · estantería {est}: estructura eliminada")
 
 def proponer_estructura(area):
-    """Propone la estructura según lo ya guardado: {estantería: (última fila usada, última columna usada, mínimo D)}."""
+    """Propone la estructura según lo ya guardado: {estantería: (última fila, última columna, niveles o None)}.
+    Los niveles solo se proponen si algún paquete (fuera de la fila 0) pasa del nivel 5."""
     tabla = "paquetes" if area == "E" else "eventos"
     prop = {}
-    for r in conectar_db().execute(f"SELECT estanteria, MAX(CAST(fila AS INTEGER)), MAX(UPPER(columna)) FROM {tabla} GROUP BY estanteria").rows:
+    sql = (f"SELECT estanteria, MAX(CAST(fila AS INTEGER)), MAX(UPPER(columna)), "
+           f"MAX(CASE WHEN CAST(fila AS INTEGER) > 0 THEN CAST(pila AS INTEGER) END) FROM {tabla} GROUP BY estanteria")
+    for r in conectar_db().execute(sql).rows:
         if r[0] is None or str(r[0]).strip() == "": continue
         col = str(r[2] or "D").strip().upper()
-        prop[str(r[0]).strip()] = (int(r[1] or 0), col if (len(col) == 1 and "D" <= col <= "F") else "D")
+        niv = int(r[3]) if r[3] and int(r[3]) > NIVELES_NORMALES + 1 else None
+        prop[str(r[0]).strip()] = (int(r[1] or 0), col if (len(col) == 1 and "D" <= col <= "F") else "D", niv)
     return dict(sorted(prop.items(), key=lambda kv: (0, int(kv[0])) if kv[0].isdigit() else (1, kv[0])))
 
 def error_fila(area, est, fila):
@@ -3030,7 +3054,12 @@ def validar_ubicacion(area, est, fila, col, pila):
     pila = str(pila).strip()
     if not pila.isdigit() or int(pila) < 1: return "El nivel (pila) debe ser un número desde 1.", None
     f, n = int(str(fila).strip()), int(pila)
-    if f != 0:
+    e = estructura_de(area, est)
+    niv_max = e[2] if e and len(e) > 2 and e[2] else None
+    if f != 0 and niv_max:
+        if n > niv_max:
+            return f"El nivel {n} no es válido: la estantería {str(est).strip()} llega hasta el nivel {niv_max}. Solo la fila 0 no tiene límite.", None
+    elif f != 0:
         if n > NIVELES_NORMALES + 1:
             return (f"El nivel {n} no es válido: de la fila 1 en adelante el máximo es {NIVELES_NORMALES + 1} "
                     f"(el {NIVELES_NORMALES + 1} es excepcional). Solo la fila 0 no tiene límite."), None
@@ -3136,10 +3165,10 @@ def texto_estructura(area):
     if not nombres: lineas.append("Aún no hay estanterías con paquetes ni estructura registrada.")
     for est in nombres:
         if est in defin:
-            lineas.append(f"• Estantería {est}: filas 0 a {defin[est][0]}, columnas A a {defin[est][1]}")
+            lineas.append(f"• Estantería {est}: {_texto_estructura(*defin[est])}")
         else:
-            f, c = prop[est]
-            lineas.append(f"• Estantería {est}: sin definir (los paquetes llegan a la fila {f}, columna {c})")
+            f, c, niv = prop[est]
+            lineas.append(f"• Estantería {est}: sin definir (los paquetes llegan a la fila {f}, columna {c}" + (f", nivel {niv}" if niv else "") + ")")
     return "\n".join(lineas)
 
 async def estructura_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3162,14 +3191,14 @@ async def estructura_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nuevas = {e: v for e, v in proponer_estructura(area).items() if e not in defin}
         if not nuevas:
             await editar_texto(query, "Todas las estanterías con paquetes ya tienen estructura definida.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data=f"est_area_{area}")]])); return
-        lineas = [f"🪄 Propuesta · {NOMBRE_AREA[area]}", ""] + [f"• Estantería {e}: filas 0 a {f}, columnas A a {c}" for e, (f, c) in nuevas.items()]
+        lineas = [f"🪄 Propuesta · {NOMBRE_AREA[area]}", ""] + [f"• Estantería {e}: {_texto_estructura(f, c, n)}" for e, (f, c, n) in nuevas.items()]
         lineas.append("\n⚠️ Se calcula con lo que ya está guardado. Si hay paquetes con una fila o columna equivocada, la propuesta saldrá equivocada: corrígelos primero con 🔎 REVISAR UBICACIONES, o ajusta cada estantería a mano.")
         botones = [[InlineKeyboardButton("✅ Guardar esta propuesta", callback_data=f"est_guardar_{area}")], [InlineKeyboardButton("⬅️ Cancelar", callback_data=f"est_area_{area}")]]
         await editar_texto(query, "\n".join(lineas), reply_markup=InlineKeyboardMarkup(botones))
     elif accion == "est_guardar":
         defin = {est for (a, est) in cargar_estructura(True) if a == area}
         nuevas = {e: v for e, v in proponer_estructura(area).items() if e not in defin}
-        for e, (f, c) in nuevas.items(): guardar_estructura(area, e, f, c)
+        for e, (f, c, n) in nuevas.items(): guardar_estructura(area, e, f, c, n)
         await editar_texto(query, f"✅ Se guardó la estructura de {len(nuevas)} estantería(s).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Ver estructura", callback_data=f"est_area_{area}")]]))
 
 async def estructura_definir_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3178,24 +3207,33 @@ async def estructura_definir_inicio(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query; await query.answer()
     area = query.data.replace("est_def_", "")
     context.user_data["est_area"] = area
-    await editar_texto(query, f"✏️ {NOMBRE_AREA[area]}\n\nEscribe: <estantería> <última fila> <última columna>\nEjemplo: 1 4 D   (la estantería 1 tiene filas 0 a 4 y columnas A a D)\n\nPara quitar la estructura de una estantería: <estantería> quitar\n\n(/cancelar para salir)")
+    await editar_texto(query, f"✏️ {NOMBRE_AREA[area]}\n\nEscribe: <estantería> <última fila> <última columna> [niveles]\n\n• 1 4 D   → filas 0 a 4, columnas A a D, niveles normales (hasta 4; el 5 con confirmación)\n• 2 4 D 7   → igual, pero la estantería 2 llega hasta el nivel 7\n• 2 niveles 6   → solo cambia el límite de niveles de la estantería 2\n• 2 niveles auto   → vuelve al límite normal\n• 2 quitar   → elimina la estructura de esa estantería\n\nLa fila 0 nunca tiene límite de niveles.\n\n(/cancelar para salir)")
     return ES_TEXTO
 
 async def estructura_definir_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     area = context.user_data.get("est_area", "E")
     partes = update.message.text.split()
     btn = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Ver estructura", callback_data=f"est_area_{area}")]])
+    entero_ok = lambda v: v.isdigit() and 1 <= int(v) <= 30
     try:
         if len(partes) == 2 and partes[1].lower() == "quitar":
             quitar_estructura(area, partes[0])
             await update.message.reply_text(f"✅ Se quitó la estructura de la estantería {partes[0]}.", reply_markup=btn)
-        elif len(partes) == 3 and partes[1].isdigit() and len(partes[2]) == 1 and partes[2].upper() in "DEF":
-            guardar_estructura(area, partes[0], int(partes[1]), partes[2])
-            await update.message.reply_text(f"✅ Estantería {partes[0]}: filas 0 a {int(partes[1])}, columnas A a {partes[2].upper()}.", reply_markup=btn)
+        elif len(partes) == 3 and partes[1].lower() == "niveles":
+            if (area, partes[0]) not in cargar_estructura(True):
+                await update.message.reply_text(f"⚠️ La estantería {partes[0]} aún no tiene estructura. Defínela completa, por ejemplo: {partes[0]} 4 D 7. Inténtalo de nuevo o /cancelar:"); return ES_TEXTO
+            if partes[2].lower() == "auto": guardar_niveles(area, partes[0], None)
+            elif entero_ok(partes[2]): guardar_niveles(area, partes[0], int(partes[2]))
+            else: raise ValueError
+            e = estructura_de(area, partes[0])
+            await update.message.reply_text(f"✅ Estantería {partes[0]}: {_texto_estructura(*e)}.", reply_markup=btn)
+        elif len(partes) in (3, 4) and partes[1].isdigit() and len(partes[2]) == 1 and partes[2].upper() in "DEF" and (len(partes) == 3 or entero_ok(partes[3])):
+            guardar_estructura(area, partes[0], int(partes[1]), partes[2], int(partes[3]) if len(partes) == 4 else None)
+            await update.message.reply_text(f"✅ Estantería {partes[0]}: {_texto_estructura(*estructura_de(area, partes[0]))}.", reply_markup=btn)
         else:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("⚠️ Formato inválido. Ejemplo: 1 4 D   (la última columna puede ser D, E o F). Inténtalo de nuevo o /cancelar:"); return ES_TEXTO
+        await update.message.reply_text("⚠️ Formato inválido. Ejemplos: 1 4 D  ·  2 4 D 7  ·  2 niveles 6  ·  2 quitar. Inténtalo de nuevo o /cancelar:"); return ES_TEXTO
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -3443,10 +3481,11 @@ OFFLINE_HTML = r"""<!doctype html>
 <script>
 /*PURAS*/
 const NIVELES = 4;
-function siguienteUbic(o) {
+function siguienteUbic(o, limite) {
+  const lim = limite || NIVELES;
   const p = parseInt(o.pila, 10);
   if (isNaN(p)) return { est: o.est, fila: o.fila, col: o.col, pila: o.pila };
-  if (String(o.fila) === '0' || p < NIVELES) return { est: o.est, fila: o.fila, col: o.col, pila: String(p + 1) };
+  if (String(o.fila) === '0' || p < lim) return { est: o.est, fila: o.fila, col: o.col, pila: String(p + 1) };
   const cols = (o.col === 'E' || o.col === 'F') ? 'ABCDEF' : 'ABCD';
   const i = cols.indexOf(o.col);
   if (i >= 0 && i + 1 < cols.length) return { est: o.est, fila: o.fila, col: cols[i + 1], pila: '1' };
@@ -3458,8 +3497,8 @@ function linea(it) {
   if (it.tipo === 'E') return ['E', d.usuario, d.del, d.al, d.paq, d.est, d.fila, d.col, d.pila, d.gen || ''].map(limpio).join(';');
   return ['V', d.tipo, d.anio, d.paq, d.ini, d.fin, d.est, d.fila, d.col, d.pila, d.gen || ''].map(limpio).join(';');
 }
-function sugerirSiguiente(tipo, d) {
-  const u = siguienteUbic(d);
+function sugerirSiguiente(tipo, d, limite) {
+  const u = siguienteUbic(d, limite);
   const gen = /^\d+$/.test(String(d.gen || '').trim()) ? String(parseInt(d.gen, 10) + 1) : '';
   if (tipo === 'E') return { usuario: d.usuario, paq: String((parseInt(d.paq, 10) || 0) + 1), est: u.est, fila: u.fila, col: u.col, pila: u.pila, gen: gen };
   return { tipo: d.tipo, anio: d.anio, paq: String((parseInt(d.paq, 10) || 0) + 1), ini: String((parseInt(d.fin, 10) || 0) + 1), est: u.est, fila: u.fila, col: u.col, pila: u.pila, gen: gen };
@@ -3474,7 +3513,8 @@ function validar(tipo, d, estr) {
     const f = parseInt(d.fila, 10), n = parseInt(d.pila, 10), col = String(d.col).trim().toUpperCase(), est = String(d.est).trim(), e = estr && estr[est];
     if (e && f > e.fila_max) return 'La fila ' + f + ' no existe: la estantería ' + est + ' llega hasta la fila ' + e.fila_max + '.';
     if (e && col > e.col_max) return 'La columna ' + col + ' no existe: la estantería ' + est + ' llega hasta la columna ' + e.col_max + '.';
-    if (f !== 0 && n > NIVELES + 1) return 'El nivel ' + n + ' no es válido: de la fila 1 en adelante el máximo es ' + (NIVELES + 1) + ' (el ' + (NIVELES + 1) + ' es excepcional). Solo la fila 0 no tiene límite.';
+    if (f !== 0 && e && e.niv_max && n > e.niv_max) return 'El nivel ' + n + ' no es válido: la estantería ' + est + ' llega hasta el nivel ' + e.niv_max + '. Solo la fila 0 no tiene límite.';
+    if (f !== 0 && !(e && e.niv_max) && n > NIVELES + 1) return 'El nivel ' + n + ' no es válido: de la fila 1 en adelante el máximo es ' + (NIVELES + 1) + ' (el ' + (NIVELES + 1) + ' es excepcional). Solo la fila 0 no tiene límite.';
   }
   if (!entero(d.paq) || parseInt(d.paq, 10) < 1) return 'El N° de paquete debe ser un número.';
   if (String(d.gen || '').trim() && !entero(d.gen)) return 'El N° General debe ser un número o quedar vacío.';
@@ -3594,7 +3634,8 @@ function dibujarLista() {
 function agregar() {
   const d = leerForm(), err = validar(tipo, d, (estructura || {})[tipo]);
   if (err) { mostrarError(err); return; }
-  if (parseInt(d.fila, 10) !== 0 && parseInt(d.pila, 10) === NIVELES + 1 && !confirm('El nivel ' + (NIVELES + 1) + ' es excepcional (lo normal es hasta el ' + NIVELES + '). ¿Confirmas que este paquete va en el nivel ' + (NIVELES + 1) + '?')) return;
+  const eSel = ((estructura || {})[tipo] || {})[String(d.est).trim()], lim = eSel && eSel.niv_max ? eSel.niv_max : 0;
+  if (!lim && parseInt(d.fila, 10) !== 0 && parseInt(d.pila, 10) === NIVELES + 1 && !confirm('El nivel ' + (NIVELES + 1) + ' es excepcional (lo normal es hasta el ' + NIVELES + '). ¿Confirmas que este paquete va en el nivel ' + (NIVELES + 1) + '?')) return;
   if (String(d.gen || '').trim()) {
     const otro = items.findIndex((it, i) => i !== editando && it.tipo === tipo && String(it.datos.gen || '').trim() !== '' && parseInt(it.datos.gen, 10) === parseInt(d.gen, 10));
     if (otro >= 0) { mostrarError('El N° General ' + d.gen + ' ya lo usaste en otro pendiente (Paq ' + items[otro].datos.paq + '). Cambia el número o déjalo vacío para que lo asigne el bot.'); return; }
@@ -3603,7 +3644,7 @@ function agregar() {
   let indice;
   if (editando !== null) { items[editando] = { tipo, datos: d, ts: items[editando].ts, sel: items[editando].sel }; indice = editando; editando = null; }
   else { items.push({ tipo, datos: d, ts: Date.now(), sel: true }); indice = items.length - 1; }
-  borradores[tipo] = sugerirSiguiente(tipo, d);
+  borradores[tipo] = sugerirSiguiente(tipo, d, lim);
   guardar(); $('cancelarEdicion').style.display = 'none'; $('agregar').textContent = '➕ Guardar en el celular';
   dibujarForm(); dibujarLista();
   $('guardado').innerHTML = '<div class="card"><span class="ok">✅ Guardado en el celular.</span><button class="btn" id="impUltima">🏷️ Imprimir la etiqueta de este paquete</button></div>';
@@ -3692,8 +3733,8 @@ def offline_manifest():
 def offline_estructura():
     datos = {"E": {}, "V": {}}
     try:
-        for (area, est), (fila_max, col_max) in cargar_estructura(True).items():
-            datos[area][est] = {"fila_max": fila_max, "col_max": col_max}
+        for (area, est), (fila_max, col_max, niv_max) in cargar_estructura(True).items():
+            datos[area][est] = {"fila_max": fila_max, "col_max": col_max, "niv_max": niv_max}
     except Exception:
         pass
     r = Response(json.dumps(datos), mimetype="application/json"); r.headers["Cache-Control"] = "no-store"; return r
